@@ -49,7 +49,7 @@ class VoiceEngine:
         log.info("VoiceEngine ready (aplay=%s, windows=%s).",
                  _APLAY is not None, _IS_WINDOWS)
 
-    # ── TTS ───────────────────────────────────────────────────────────────────
+    # TTS
 
     def synthesize(self, text: str, out_path: str = None) -> str:
         if out_path is None:
@@ -100,7 +100,7 @@ class VoiceEngine:
             log.warning("ffmpeg conversion failed: %s", e)
         return False
 
-    # ── Playback ──────────────────────────────────────────────────────────────
+    # Playback 
 
     def play_audio_nonblocking(self, path: str):
         """Start audio playback (non-blocking). Returns immediately."""

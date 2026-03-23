@@ -5,7 +5,7 @@ import os
 import sys
 import shutil
 
-# ─── Frozen-app detection (PyInstaller) ───────────────────────────────────────
+# Frozen-app detection (PyInstaller) 
 FROZEN = getattr(sys, "frozen", False)
 
 if FROZEN:
@@ -15,7 +15,7 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     _INTERNAL = BASE_DIR
 
-# ─── Paths ────────────────────────────────────────────────────────────────────
+#  Paths 
 AVATAR_IMAGE        = os.path.join(BASE_DIR, "avatar.png")
 WAV2LIP_DIR         = os.path.join(BASE_DIR, "Wav2Lip")
 WAV2LIP_CHECKPOINT  = os.path.join(WAV2LIP_DIR, "checkpoints", "wav2lip_gan.pth")
@@ -34,7 +34,7 @@ else:
 
 PYTHON_FOR_SUBPROCESS = _EMBED_PYTHON or sys.executable
 
-# ─── FFmpeg ───────────────────────────────────────────────────────────────────
+#  FFmpeg 
 if FROZEN:
     _ffmpeg_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
     FFMPEG_BIN = os.path.join(BASE_DIR, _ffmpeg_name)
@@ -49,14 +49,14 @@ else:
         except ImportError:
             FFMPEG_BIN = "ffmpeg"
 
-# ─── Greeting ─────────────────────────────────────────────────────────────────
+#  Greeting 
 GREETING_TEXT = "My name is Obi. I am your observability assistant."
 
-# ─── Voice ────────────────────────────────────────────────────────────────────
+#  Voice 
 TTS_VOICE    = "en-US-AriaNeural"
 WHISPER_MODEL = "base"
 
-# ─── UI ───────────────────────────────────────────────────────────────────────
+#  UI 
 WINDOW_TITLE  = "Obi — Observability Assistant"
 WINDOW_W      = 1100
 WINDOW_H      = 720

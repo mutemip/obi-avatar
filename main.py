@@ -28,7 +28,7 @@ GREETING_AUDIO_CACHE = os.path.join(TEMP_DIR, "greeting_cached.wav")
 GREETING_VIDEO_CACHE = os.path.join(TEMP_DIR, "greeting_cached.mp4")
 
 
-# ─── Worker signal bus ────────────────────────────────────────────────────────
+# Worker signal bus 
 class Signals(QObject):
     avatar_frames  = pyqtSignal(list, float, str)
     status         = pyqtSignal(str)
@@ -36,7 +36,7 @@ class Signals(QObject):
     greeting_ready = pyqtSignal()
 
 
-# ─── Main Window ──────────────────────────────────────────────────────────────
+# Main Window 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -56,8 +56,7 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(500, self._prepare_greeting)
 
-    # ── UI ─────────────────────────────────────────────────────────────────────
-
+    # UI 
     def _setup_ui(self):
         self.setWindowTitle(WINDOW_TITLE)
         self.setFixedSize(AVATAR_DISPLAY_W + 60, AVATAR_DISPLAY_H + 200)
@@ -132,7 +131,7 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
-    # ── Signals ────────────────────────────────────────────────────────────────
+    # Signals 
 
     def _connect_signals(self):
         self.signals.avatar_frames.connect(self._start_playback)
@@ -149,8 +148,7 @@ class MainWindow(QMainWindow):
         self.think_timer   = QTimer()
         self.think_timer.timeout.connect(self._thinking_frame)
 
-    # ── Greeting ───────────────────────────────────────────────────────────────
-
+    # Greeting
     def _prepare_greeting(self):
         self._start_thinking_animation()
 
@@ -205,7 +203,7 @@ class MainWindow(QMainWindow):
                 self._greeting_audio
             )
 
-    # ── Avatar frame playback ─────────────────────────────────────────────────
+    # Avatar frame playback 
 
     def _start_thinking_animation(self):
         self._think_idx = 0
@@ -263,7 +261,7 @@ class MainWindow(QMainWindow):
         self.avatar_label.setPixmap(self._frames[self._frame_idx])
         self._frame_idx += 1
 
-    # ── Helpers ────────────────────────────────────────────────────────────────
+    # Helpers
 
     def _status(self, msg: str):
         self.status_bar.showMessage(msg)
@@ -285,7 +283,7 @@ class MainWindow(QMainWindow):
         self.status_dot.setStyleSheet(f"color: {color}; font-size: 13px;")
 
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+# Entry point 
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
