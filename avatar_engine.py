@@ -1,0 +1,186 @@
+"""
+avatar_engine.py
+Wraps Wav2Lip inference and converts the output video into
+a sequence of QPixmap frames that the Qt UI can display.
+
+Wav2Lip pipeline:
+  avatar.png  +  response.wav  ->  [Wav2Lip]  ->  output.mp4  ->  frames
+"""
+import logging
+import os
+import subprocess
+import sys
+
+import cv2
+import numpy as np
+from PyQt5.QtGui import QImage, QPixmap, QColor, QPainter, QFont
+from PyQt5.QtCore import Qt
+
+from config import (AVATAR_IMAGE, WAV2LIP_DIR, WAV2LIP_CHECKPOINT,
+                    TEMP_DIR, AVATAR_DISPLAY_W, AVATAR_DISPLAY_H,
+                    FFMPEG_BIN, PYTHON_FOR_SUBPROCESS, FROZEN)
+
+log = logging.getLogger(__name__)
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+
+class AvatarEngine:
+    def __init__(self):
+        self.wav2lip_available = self._check_wav2lip()
+        self.static_frame = self._load_static_avatar()
+
+    def _check_wav2lip(self) -> bool:
+        inference = os.path.join(WAV2LIP_DIR, "inference.py")
+        ckpt = WAV2LIP_CHECKPOINT
+        if not os.path.isfile(inference):
+            log.warning("Wav2Lip inference.py not found at %s.", WAV2LIP_DIR)
+            return False
+        if not os.path.isfile(ckpt):
+            log.warning("Wav2Lip checkpoint not found at %s.", ckpt)
+            return False
+        if FROZEN and PYTHON_FOR_SUBPROCESS == sys.executable:
+            log.warning("Frozen build but no embedded Python found — "
+                        "Wav2Lip subprocess will not work.")
+            return False
+        log.info("Wav2Lip is available.")
+        return True
+
+    def _load_static_avatar(self) -> QPixmap:
+        if os.path.isfile(AVATAR_IMAGE):
+            img = cv2.imread(AVATAR_IMAGE)
+            if img is not None:
+                return self._cv2_to_pixmap(img)
+            log.warning("Could not decode %s — using placeholder.", AVATAR_IMAGE)
+        else:
+            log.warning("avatar.png not found — using placeholder.")
+        return self._create_placeholder()
+
+    @staticmethod
+    def _create_placeholder() -> QPixmap:
+        pix = QPixmap(AVATAR_DISPLAY_W, AVATAR_DISPLAY_H)
+        pix.fill(QColor("#1a1e2b"))
+        p = QPainter(pix)
+        p.setPen(QColor("#4f8ef7"))
+        f = QFont("Segoe UI", 18, QFont.Bold)
+        p.setFont(f)
+        p.drawText(pix.rect(), Qt.AlignCenter, "Obi\n(place avatar.png here)")
+        p.end()
+        return pix
+
+    def _wav2lip_env(self) -> dict:
+        """Build an env dict that puts ffmpeg on PATH for Wav2Lip subprocess."""
+        env = os.environ.copy()
+        ffmpeg_dir = os.path.dirname(FFMPEG_BIN) if FFMPEG_BIN else ""
+        if FROZEN:
+            from config import BASE_DIR
+            env["PATH"] = (BASE_DIR + os.pathsep +
+                           ffmpeg_dir + os.pathsep +
+                           env.get("PATH", ""))
+        else:
+            venv_bin = os.path.dirname(sys.executable)
+            env["PATH"] = (venv_bin + os.pathsep +
+                           ffmpeg_dir + os.pathsep +
+                           env.get("PATH", ""))
+        return env
+
+    def generate_talking_video(self, audio_path: str,
+                               out_path: str = None,
+                               resize_factor: int = 0) -> str:
+        if not self.wav2lip_available:
+            log.warning("Wav2Lip unavailable — skipping lip-sync generation.")
+            return ""
+
+        audio_path = os.path.abspath(audio_path)
+        if out_path is None:
+            out_path = os.path.join(TEMP_DIR, "talking.mp4")
+        out_path = os.path.abspath(out_path)
+
+        cmd = [
+            PYTHON_FOR_SUBPROCESS,
+            os.path.join(WAV2LIP_DIR, "inference.py"),
+            "--checkpoint_path", os.path.abspath(WAV2LIP_CHECKPOINT),
+            "--face", os.path.abspath(AVATAR_IMAGE),
+            "--audio", audio_path,
+            "--outfile", out_path,
+            "--pads", "0", "20", "0", "0",
+            "--nosmooth",
+        ]
+        if resize_factor > 1:
+            cmd.extend(["--resize_factor", str(resize_factor)])
+
+        log.info("Running Wav2Lip: %s", " ".join(cmd))
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                cwd=WAV2LIP_DIR, timeout=300,
+                env=self._wav2lip_env(),
+            )
+            if result.returncode != 0:
+                log.error("Wav2Lip stdout:\n%s", result.stdout[-2000:])
+                log.error("Wav2Lip stderr:\n%s", result.stderr[-2000:])
+                if resize_factor < 2 and "OutOfMemoryError" in result.stderr:
+                    log.info("Retrying with --resize_factor 2 …")
+                    return self.generate_talking_video(
+                        audio_path, out_path, resize_factor=2)
+                return ""
+            if os.path.isfile(out_path):
+                log.info("Talking video ready: %s", out_path)
+                return out_path
+        except subprocess.TimeoutExpired:
+            log.error("Wav2Lip timed out after 300s.")
+        except Exception as e:
+            log.error("Wav2Lip error: %s", e)
+        return ""
+
+    def extract_frames(self, video_path: str) -> list:
+        if not video_path or not os.path.isfile(video_path):
+            return []
+
+        frames = []
+        cap = cv2.VideoCapture(video_path)
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(self._cv2_to_pixmap(frame))
+        cap.release()
+        log.info("Extracted %d frames from %s", len(frames), video_path)
+        return frames
+
+    def get_video_fps(self, video_path: str) -> float:
+        if not video_path or not os.path.isfile(video_path):
+            return 25.0
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        cap.release()
+        return fps
+
+    @staticmethod
+    def _cv2_to_pixmap(frame: np.ndarray) -> QPixmap:
+        if frame is None:
+            return QPixmap()
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
+        pix = QPixmap.fromImage(qimg)
+        return pix.scaled(
+            AVATAR_DISPLAY_W, AVATAR_DISPLAY_H,
+            Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+
+    def get_idle_pixmap(self) -> QPixmap:
+        return self.static_frame
+
+    def get_thinking_frames(self) -> list:
+        if not os.path.isfile(AVATAR_IMAGE):
+            return [self.static_frame]
+        img = cv2.imread(AVATAR_IMAGE)
+        if img is None:
+            return [self.static_frame]
+        img = img.astype(np.float32)
+        frames = []
+        for alpha in [1.0, 1.08, 1.15, 1.08, 1.0]:
+            bright = np.clip(img * alpha, 0, 255).astype(np.uint8)
+            frames.append(self._cv2_to_pixmap(bright))
+        return frames

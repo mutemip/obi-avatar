@@ -1,0 +1,10 @@
+# Build dependencies for packaging Obi as a Windows .exe
+# Install in a build venv: pip install -r requirements_build.txt
+
+pyinstaller>=6.0
+PyQt5>=5.15.0
+edge-tts>=6.1.0
+pydub>=0.25.1
+opencv-python-headless>=4.9.0
+numpy>=1.26.0
+imageio-ffmpeg>=0.5.1
