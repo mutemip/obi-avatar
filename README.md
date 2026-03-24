@@ -21,7 +21,6 @@ MS Proactive is a Python-based project for audio-visual speech synthesis and lip
 1. **Clone the repository**
 2. **Install dependencies:**
    ```bash
-   pip install -r Wav2Lip/requirements.txt
    pip install -r requirements_build.txt
    ```
 3. **Download pre-trained models:**
