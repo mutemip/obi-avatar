@@ -26,7 +26,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 _IS_WINDOWS = platform.system() == "Windows"
 
-# ── Optional dependency detection ─────────────────────────────────────────────
+# ── Optional dependency detection 
 
 try:
     import sounddevice as sd
@@ -74,7 +74,7 @@ class VoiceEngine:
             _HAS_SOUNDDEVICE, _HAS_WHISPER,
         )
 
-    # ── TTS ───────────────────────────────────────────────────────────────────
+    # ── TTS 
 
     def synthesize(self, text: str, out_path: str | None = None) -> str:
         if out_path is None:
@@ -125,7 +125,7 @@ class VoiceEngine:
             log.warning("ffmpeg conversion failed: %s", e)
         return False
 
-    # ── Mic recording ─────────────────────────────────────────────────────────
+    # ── Mic recording 
 
     @property
     def mic_available(self) -> bool:
@@ -177,8 +177,7 @@ class VoiceEngine:
         log.info("Mic recording saved to %s (%d samples).", out_path, len(audio))
         return out_path
 
-    # ── Speech-to-text ────────────────────────────────────────────────────────
-
+    # ── Speech-to-text 
     def transcribe(self, audio_path: str) -> str:
         if not _HAS_WHISPER:
             log.error("faster-whisper not installed — cannot transcribe.")
@@ -197,7 +196,7 @@ class VoiceEngine:
         log.info("Transcription: %s", text)
         return text
 
-    # ── Playback ──────────────────────────────────────────────────────────────
+    # ── Playback 
 
     def play_audio_nonblocking(self, path: str):
         self.stop_playback()

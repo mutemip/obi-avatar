@@ -54,8 +54,7 @@ class LLMEngine:
         except Exception as exc:
             log.error("Cannot connect to Ollama at %s: %s", OLLAMA_HOST, exc)
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
+    # ── Public API 
     def is_available(self) -> bool:
         return self._available
 
@@ -86,7 +85,7 @@ class LLMEngine:
             log.error("Ollama generation error: %s", exc)
             return f"Sorry, I encountered an error generating a response: {exc}"
 
-    # ── Internals ─────────────────────────────────────────────────────────────
+    # ── Internals 
 
     @staticmethod
     def _build_system_prompt(kb_summary: str) -> str:

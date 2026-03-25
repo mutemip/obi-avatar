@@ -36,7 +36,7 @@ GREETING_AUDIO_CACHE = os.path.join(TEMP_DIR, "greeting_cached.wav")
 GREETING_VIDEO_CACHE = os.path.join(TEMP_DIR, "greeting_cached.mp4")
 
 
-# ── Qt signals ────────────────────────────────────────────────────────────────
+# ── Qt signals 
 
 class Signals(QObject):
     avatar_frames      = pyqtSignal(list, float, str)
@@ -51,7 +51,7 @@ class Signals(QObject):
     transcription_done = pyqtSignal(str)
 
 
-# ── Chat bubble widget ────────────────────────────────────────────────────────
+# ── Chat bubble widget 
 
 class ChatBubble(QFrame):
     def __init__(self, text: str, is_user: bool = False, parent=None):
@@ -119,7 +119,7 @@ class SystemMessage(QLabel):
         )
 
 
-# ── Main Window ───────────────────────────────────────────────────────────────
+# ── Main Window 
 
 class MainWindow(QMainWindow):
 
@@ -164,7 +164,7 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(500, self._prepare_greeting)
 
-    # ── UI construction ───────────────────────────────────────────────────────
+    # ── UI construction 
 
     def _setup_ui(self):
         self.setWindowTitle(WINDOW_TITLE)
@@ -351,7 +351,7 @@ class MainWindow(QMainWindow):
 
         return panel
 
-    # ── Signal wiring ─────────────────────────────────────────────────────────
+    # ── Signal wiring 
 
     def _connect_signals(self):
         self.signals.avatar_frames.connect(self._start_playback)
@@ -379,7 +379,7 @@ class MainWindow(QMainWindow):
         self._audio_done_timer.setSingleShot(True)
         self._audio_done_timer.timeout.connect(self._on_audio_only_done)
 
-    # ── Startup info ──────────────────────────────────────────────────────────
+    # ── Startup info 
 
     def _show_startup_info(self):
         kb_count = self.kb.doc_count()
@@ -396,7 +396,7 @@ class MainWindow(QMainWindow):
             self._add_system_message(
                 "⚠ Ollama not reachable — start Ollama and restart the app")
 
-    # ── Greeting ──────────────────────────────────────────────────────────────
+    # ── Greeting 
 
     def _prepare_greeting(self):
         self._start_thinking_animation()
@@ -444,7 +444,7 @@ class MainWindow(QMainWindow):
                 self._greeting_audio)
             self.replay_btn.setEnabled(True)
 
-    # ── Replay (greeting or last response) ────────────────────────────────────
+    # ── Replay (greeting or last response)
 
     def _replay(self):
         if self._is_speaking or self._is_processing:
@@ -460,7 +460,7 @@ class MainWindow(QMainWindow):
                 self._greeting_frames, self._greeting_fps,
                 self._greeting_audio)
 
-    # ── User input handling ───────────────────────────────────────────────────
+    # ── User input handling 
 
     def _on_send(self):
         text = self.text_input.text().strip()
@@ -526,7 +526,7 @@ class MainWindow(QMainWindow):
         self._add_chat_bubble(text, is_user=True)
         self._process_query(text)
 
-    # ── Response pipeline (async: audio-first, lip-sync in background) ────────
+    # ── Response pipeline (async: audio-first, lip-sync in background) 
 
     def _process_query(self, question: str):
         self._is_processing = True
@@ -541,7 +541,7 @@ class MainWindow(QMainWindow):
         def _worker():
             audio_path = None
             try:
-                # ── Phase 1: Fast path ────────────────────────────────────
+                # ── Phase 1: Fast path 
                 context_docs = self.kb.query(question, top_k=5)
 
                 self.signals.status.emit("Generating response …")
@@ -589,7 +589,7 @@ class MainWindow(QMainWindow):
                 self.signals.enable_input.emit()
                 return
 
-            # ── Phase 2: Background lip-sync generation ───────────────
+            # ── Phase 2: Background lip-sync generation 
             if (not ENABLE_LIPSYNC
                     or not self.av_eng.wav2lip_available
                     or not audio_path):
@@ -620,7 +620,7 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    # ── Audio-only playback (Phase 1 — immediate) ─────────────────────────────
+    # ── Audio-only playback (Phase 1 — immediate) 
 
     def _play_audio_only(self, audio_path: str):
         self.think_timer.stop()
@@ -651,7 +651,7 @@ class MainWindow(QMainWindow):
             self._update_status("Ready")
             self._update_replay_btn()
 
-    # ── Mid-playback lip-sync switch (Phase 2 delivers frames) ────────────────
+    # ── Mid-playback lip-sync switch (Phase 2 delivers frames) 
 
     def _on_lipsync_ready(self, frames: list, fps: float):
         if not frames:
@@ -675,7 +675,7 @@ class MainWindow(QMainWindow):
 
         self._update_replay_btn()
 
-    # ── Replay button ─────────────────────────────────────────────────────────
+    # ── Replay button 
 
     def _update_replay_btn(self):
         if self._last_response_frames and self._last_response_audio:
@@ -685,7 +685,7 @@ class MainWindow(QMainWindow):
             self.replay_btn.setText("▶  Replay Greeting")
             self.replay_btn.setEnabled(True)
 
-    # ── Chat display ──────────────────────────────────────────────────────────
+    # ── Chat display 
 
     def _add_chat_bubble(self, text: str, is_user: bool = False):
         bubble = ChatBubble(text, is_user)
@@ -701,7 +701,7 @@ class MainWindow(QMainWindow):
         vbar = self.chat_scroll.verticalScrollBar()
         vbar.setValue(vbar.maximum())
 
-    # ── Input enable / disable ────────────────────────────────────────────────
+    # ── Input enable / disable 
 
     def _disable_input(self):
         self.text_input.setEnabled(False)
@@ -716,7 +716,7 @@ class MainWindow(QMainWindow):
             self.mic_btn.setEnabled(True)
         self.text_input.setFocus()
 
-    # ── Avatar frame playback ─────────────────────────────────────────────────
+    # ── Avatar frame playback 
 
     def _start_thinking_animation(self):
         self._think_idx = 0
@@ -775,7 +775,7 @@ class MainWindow(QMainWindow):
         self.avatar_label.setPixmap(self._frames[self._frame_idx])
         self._frame_idx += 1
 
-    # ── Status helpers ────────────────────────────────────────────────────────
+    # ── Status helpers 
 
     def _update_status(self, msg: str):
         self.status_bar.showMessage(msg)
@@ -803,7 +803,7 @@ class MainWindow(QMainWindow):
             f"color: {color}; font-size: 12px; background: transparent;")
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point 
 
 def main():
     app = QApplication(sys.argv)

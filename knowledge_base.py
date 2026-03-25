@@ -34,7 +34,7 @@ class KnowledgeBase:
 
         self._load_data()
 
-    # ── Data loading ──────────────────────────────────────────────────────────
+    # ── Data loading 
 
     def _load_data(self):
         if not os.path.isfile(KNOWLEDGE_BASE_PATH):
@@ -123,13 +123,13 @@ class KnowledgeBase:
             f"(range {min(ttr_values):.1f}–{max(ttr_values):.1f} hrs)."
         )
 
-    # ── Embeddings ────────────────────────────────────────────────────────────
+    # ── Embeddings 
 
     def _embed_batch(self, texts: List[str]) -> np.ndarray:
         response = self._client.embed(model=OLLAMA_EMBED_MODEL, input=texts)
         return np.array(response["embeddings"], dtype=np.float32)
 
-    # ── Query ─────────────────────────────────────────────────────────────────
+    # ── Query 
 
     def query(self, question: str, top_k: int = 5) -> List[str]:
         if not self.documents:
@@ -160,7 +160,7 @@ class KnowledgeBase:
         scored.sort(reverse=True)
         return [self.documents[idx] for _, idx in scored[:top_k]]
 
-    # ── Public helpers ────────────────────────────────────────────────────────
+    # ── Public helpers 
 
     def get_summary(self) -> str:
         return self._summary
