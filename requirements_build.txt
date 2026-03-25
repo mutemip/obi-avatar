@@ -1,10 +1,35 @@
-# Build dependencies for packaging Obi as a Windows .exe
-# Install in a build venv: pip install -r requirements_build.txt
+# Core dependencies for Obi — Observability AI Assistant
+# Install with: pip install -r requirements_build.txt
 
-pyinstaller>=6.0
+# UI
 PyQt5>=5.15.0
-edge-tts>=6.1.0
-pydub>=0.25.1
+
+# Avatar / video
 opencv-python-headless>=4.9.0
 numpy>=1.26.0
+
+# Wav2Lip inference (lip-sync)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+torchvision>=0.15.0
+scipy>=1.10.0
+
+# TTS (text-to-speech)
+edge-tts>=6.1.0
+pydub>=0.25.1
+
+# Audio playback & recording
+sounddevice>=0.4.6
+soundfile>=0.12.1
+
+# FFmpeg (fallback if system ffmpeg missing)
 imageio-ffmpeg>=0.5.1
+
+# LLM (Ollama client)
+ollama>=0.4.0
+
+# Speech-to-text
+faster-whisper>=1.0.0
+
+# Packaging (optional — only for building .exe)
+# pyinstaller>=6.0

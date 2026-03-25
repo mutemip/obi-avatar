@@ -1,26 +1,34 @@
 """
 main.py — Obi — Observability AI Assistant — Desktop Application
-Entry point.  Run with:  python main.py
+Two-panel layout: avatar (left) + chat with RAG (right).
+Async lip-sync: audio plays immediately, Wav2Lip runs in background.
+Run with:  python main.py
 """
 import logging
 import os
 import sys
 import threading
+import time
+import wave as _wave
+from datetime import datetime
 
-from PyQt5.QtCore    import (Qt, QTimer, pyqtSignal, QObject)
-from PyQt5.QtGui     import (QColor, QPalette)
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget,
-                              QVBoxLayout, QPushButton, QLabel,
-                              QGraphicsDropShadowEffect, QStatusBar)
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
+from PyQt5.QtGui import QColor, QPalette, QFont
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
+    QPushButton, QLabel, QLineEdit, QScrollArea, QFrame, QSizePolicy,
+    QGraphicsDropShadowEffect, QStatusBar,
+)
 
-from config        import *
-from config        import GREETING_TEXT
+from config import *
 from avatar_engine import AvatarEngine
-from voice_engine  import VoiceEngine
+from voice_engine import VoiceEngine
+from knowledge_base import KnowledgeBase
+from llm_engine import LLMEngine
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
 log = logging.getLogger(__name__)
 
@@ -28,44 +36,145 @@ GREETING_AUDIO_CACHE = os.path.join(TEMP_DIR, "greeting_cached.wav")
 GREETING_VIDEO_CACHE = os.path.join(TEMP_DIR, "greeting_cached.mp4")
 
 
-# Worker signal bus 
+# ── Qt signals ────────────────────────────────────────────────────────────────
+
 class Signals(QObject):
-    avatar_frames  = pyqtSignal(list, float, str)
-    status         = pyqtSignal(str)
-    play_audio     = pyqtSignal(str)
-    greeting_ready = pyqtSignal()
+    avatar_frames      = pyqtSignal(list, float, str)
+    status             = pyqtSignal(str)
+    play_audio         = pyqtSignal(str)
+    speak_audio_only   = pyqtSignal(str)
+    lipsync_ready      = pyqtSignal(list, float)
+    greeting_ready     = pyqtSignal()
+    bot_message        = pyqtSignal(str)
+    system_message     = pyqtSignal(str)
+    enable_input       = pyqtSignal()
+    transcription_done = pyqtSignal(str)
 
 
-# Main Window 
+# ── Chat bubble widget ────────────────────────────────────────────────────────
+
+class ChatBubble(QFrame):
+    def __init__(self, text: str, is_user: bool = False, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.NoFrame)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(2)
+
+        header = QHBoxLayout()
+        sender = QLabel("You" if is_user else "Obi")
+        sender.setStyleSheet(
+            f"color: {'#7a8099' if is_user else COLOR_ACCENT}; "
+            f"font-size: 11px; font-weight: bold; background: transparent;"
+        )
+        timestamp = QLabel(datetime.now().strftime("%H:%M"))
+        timestamp.setStyleSheet(
+            f"color: {COLOR_SUBTEXT}; font-size: 10px; background: transparent;"
+        )
+
+        if is_user:
+            header.addStretch()
+            header.addWidget(timestamp)
+            header.addWidget(sender)
+        else:
+            header.addWidget(sender)
+            header.addWidget(timestamp)
+            header.addStretch()
+
+        layout.addLayout(header)
+
+        body = QLabel(text)
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+
+        bg = COLOR_USER_MSG if is_user else COLOR_BOT_MSG
+        body.setStyleSheet(
+            f"background: {bg}; color: {COLOR_TEXT}; "
+            f"padding: 10px 14px; border-radius: 12px; font-size: 13px;"
+        )
+        body.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+
+        if is_user:
+            row = QHBoxLayout()
+            row.addStretch()
+            row.addWidget(body)
+            layout.addLayout(row)
+        else:
+            row = QHBoxLayout()
+            row.addWidget(body)
+            row.addStretch()
+            layout.addLayout(row)
+
+
+class SystemMessage(QLabel):
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet(
+            f"color: {COLOR_SUBTEXT}; font-size: 11px; "
+            f"padding: 6px 12px; background: transparent;"
+        )
+
+
+# ── Main Window ───────────────────────────────────────────────────────────────
+
 class MainWindow(QMainWindow):
+
     def __init__(self):
         super().__init__()
-        self.signals  = Signals()
-        self.av_eng   = AvatarEngine()
-        self.voice    = VoiceEngine()
+        self.signals = Signals()
 
-        self._is_speaking      = False
-        self._frames           = []
-        self._frame_idx        = 0
-        self._greeting_frames  = []
-        self._greeting_fps     = 25.0
-        self._greeting_audio   = ""
+        # Engines
+        self.av_eng = AvatarEngine()
+        self.voice  = VoiceEngine()
+        self.kb     = KnowledgeBase()
+        self.llm    = LLMEngine(kb_summary=self.kb.get_summary())
+
+        # Playback state
+        self._is_speaking       = False
+        self._is_recording      = False
+        self._is_processing     = False
+        self._frames            = []
+        self._frame_idx         = 0
+
+        # Audio-only playback tracking (for mid-stream lip-sync switch)
+        self._audio_only_playing = False
+        self._audio_start_time   = 0.0
+        self._audio_duration_ms  = 0
+
+        # Query generation ID (to cancel stale background lip-sync)
+        self._query_id = 0
+
+        # Greeting cache
+        self._greeting_frames = []
+        self._greeting_fps    = 25.0
+        self._greeting_audio  = ""
+
+        # Last response cache (for replay)
+        self._last_response_audio  = ""
+        self._last_response_frames = []
+        self._last_response_fps    = 25.0
 
         self._setup_ui()
         self._connect_signals()
+        self._show_startup_info()
 
         QTimer.singleShot(500, self._prepare_greeting)
 
-    # UI 
+    # ── UI construction ───────────────────────────────────────────────────────
+
     def _setup_ui(self):
         self.setWindowTitle(WINDOW_TITLE)
-        self.setFixedSize(AVATAR_DISPLAY_W + 60, AVATAR_DISPLAY_H + 200)
+        self.setMinimumSize(WINDOW_W, WINDOW_H)
 
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{
                 background-color: {COLOR_BG};
                 color: {COLOR_TEXT};
-                font-family: 'Segoe UI', 'Inter', sans-serif;
+                font-family: 'Inter', 'Segoe UI', sans-serif;
             }}
             QStatusBar {{
                 background: {COLOR_PANEL}; color: {COLOR_SUBTEXT}; font-size: 11px;
@@ -74,28 +183,44 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(30, 30, 30, 20)
-        layout.setSpacing(14)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        name_label = QLabel("Obi")
-        name_label.setAlignment(Qt.AlignCenter)
-        name_label.setStyleSheet(f"""
-            color: {COLOR_TEXT}; font-size: 24px;
-            font-weight: 700; letter-spacing: 1px;
-        """)
+        root.addWidget(self._build_avatar_panel())
+        root.addWidget(self._build_chat_panel(), stretch=1)
 
-        role_label = QLabel("Observability Assistant")
-        role_label.setAlignment(Qt.AlignCenter)
-        role_label.setStyleSheet(f"color: {COLOR_SUBTEXT}; font-size: 13px;")
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+
+    def _build_avatar_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setFixedWidth(AVATAR_DISPLAY_W + 60)
+        panel.setStyleSheet(f"background: {COLOR_PANEL};")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(20, 24, 20, 20)
+        layout.setSpacing(10)
+
+        name_lbl = QLabel("Obi")
+        name_lbl.setAlignment(Qt.AlignCenter)
+        name_lbl.setStyleSheet(
+            f"color: {COLOR_TEXT}; font-size: 22px; font-weight: 700; "
+            f"letter-spacing: 1px; background: transparent;"
+        )
+
+        role_lbl = QLabel("Observability Assistant")
+        role_lbl.setAlignment(Qt.AlignCenter)
+        role_lbl.setStyleSheet(
+            f"color: {COLOR_SUBTEXT}; font-size: 12px; background: transparent;"
+        )
 
         self.avatar_label = QLabel()
         self.avatar_label.setFixedSize(AVATAR_DISPLAY_W, AVATAR_DISPLAY_H)
         self.avatar_label.setAlignment(Qt.AlignCenter)
-        self.avatar_label.setStyleSheet(f"""
-            border: 2px solid {COLOR_BORDER}; border-radius: 16px;
-            background: {COLOR_CARD};
-        """)
+        self.avatar_label.setStyleSheet(
+            f"border: 2px solid {COLOR_BORDER}; border-radius: 14px; "
+            f"background: {COLOR_CARD};"
+        )
         self._avatar_glow = QGraphicsDropShadowEffect()
         self._avatar_glow.setBlurRadius(30)
         self._avatar_glow.setColor(QColor(COLOR_ACCENT))
@@ -105,59 +230,183 @@ class MainWindow(QMainWindow):
 
         self.status_dot = QLabel("● Initializing …")
         self.status_dot.setAlignment(Qt.AlignCenter)
-        self.status_dot.setStyleSheet(f"color: {COLOR_ACCENT}; font-size: 13px;")
+        self.status_dot.setStyleSheet(
+            f"color: {COLOR_ACCENT}; font-size: 12px; background: transparent;"
+        )
 
         self.replay_btn = QPushButton("▶  Replay Greeting")
-        self.replay_btn.setFixedHeight(40)
+        self.replay_btn.setFixedHeight(36)
+        self.replay_btn.setCursor(Qt.PointingHandCursor)
         self.replay_btn.setStyleSheet(f"""
             QPushButton {{
                 background: {COLOR_CARD}; color: {COLOR_ACCENT};
-                border: none; border-radius: 10px;
-                font-size: 14px; font-weight: 600;
+                border: 1px solid {COLOR_BORDER}; border-radius: 8px;
+                font-size: 12px; font-weight: 600;
             }}
-            QPushButton:hover  {{ background: {COLOR_ACCENT}; color: #fff; }}
-            QPushButton:pressed {{ opacity: 0.8; }}
+            QPushButton:hover {{ background: {COLOR_ACCENT}; color: #fff; }}
         """)
-        self.replay_btn.clicked.connect(self._replay_greeting)
+        self.replay_btn.clicked.connect(self._replay)
         self.replay_btn.setEnabled(False)
 
-        layout.addWidget(name_label)
-        layout.addWidget(role_label)
-        layout.addSpacing(6)
+        layout.addWidget(name_lbl)
+        layout.addWidget(role_lbl)
+        layout.addSpacing(4)
         layout.addWidget(self.avatar_label, alignment=Qt.AlignCenter)
         layout.addWidget(self.status_dot)
         layout.addWidget(self.replay_btn)
+        layout.addStretch()
+        return panel
 
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
+    def _build_chat_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(16, 16, 16, 12)
+        layout.setSpacing(10)
 
-    # Signals 
+        header = QLabel("Chat")
+        header.setStyleSheet(
+            f"color: {COLOR_TEXT}; font-size: 16px; font-weight: 700; "
+            f"background: transparent;"
+        )
+        layout.addWidget(header)
+
+        self.chat_scroll = QScrollArea()
+        self.chat_scroll.setWidgetResizable(True)
+        self.chat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.chat_scroll.setStyleSheet(f"""
+            QScrollArea {{
+                background: {COLOR_BG}; border: 1px solid {COLOR_BORDER};
+                border-radius: 12px;
+            }}
+            QScrollBar:vertical {{
+                width: 6px; background: transparent;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {COLOR_BORDER}; border-radius: 3px; min-height: 30px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+        """)
+
+        self.chat_container = QWidget()
+        self.chat_container.setStyleSheet(f"background: {COLOR_BG};")
+        self.chat_layout = QVBoxLayout(self.chat_container)
+        self.chat_layout.setAlignment(Qt.AlignTop)
+        self.chat_layout.setContentsMargins(8, 8, 8, 8)
+        self.chat_layout.setSpacing(4)
+        self.chat_scroll.setWidget(self.chat_container)
+
+        layout.addWidget(self.chat_scroll, stretch=1)
+
+        input_row = QHBoxLayout()
+        input_row.setSpacing(8)
+
+        self.text_input = QLineEdit()
+        self.text_input.setPlaceholderText("Ask Obi about your applications…")
+        self.text_input.setFixedHeight(40)
+        self.text_input.setStyleSheet(f"""
+            QLineEdit {{
+                background: {COLOR_CARD}; color: {COLOR_TEXT};
+                border: 1px solid {COLOR_BORDER}; border-radius: 10px;
+                padding: 0 14px; font-size: 13px;
+            }}
+            QLineEdit:focus {{
+                border-color: {COLOR_ACCENT};
+            }}
+        """)
+        self.text_input.returnPressed.connect(self._on_send)
+
+        btn_style = f"""
+            QPushButton {{
+                background: {COLOR_CARD}; color: {COLOR_TEXT};
+                border: 1px solid {COLOR_BORDER}; border-radius: 10px;
+                font-size: 16px;
+            }}
+            QPushButton:hover {{ background: {COLOR_ACCENT}; color: #fff; }}
+            QPushButton:disabled {{ color: {COLOR_SUBTEXT}; background: {COLOR_PANEL}; }}
+        """
+
+        self.mic_btn = QPushButton("🎤")
+        self.mic_btn.setFixedSize(40, 40)
+        self.mic_btn.setCursor(Qt.PointingHandCursor)
+        self.mic_btn.setStyleSheet(btn_style)
+        self.mic_btn.setToolTip("Click to start/stop voice recording")
+        self.mic_btn.clicked.connect(self._toggle_recording)
+        if not self.voice.mic_available:
+            self.mic_btn.setEnabled(False)
+            self.mic_btn.setToolTip("Install sounddevice for voice input")
+
+        self.send_btn = QPushButton("➤")
+        self.send_btn.setFixedSize(40, 40)
+        self.send_btn.setCursor(Qt.PointingHandCursor)
+        self.send_btn.setStyleSheet(btn_style)
+        self.send_btn.setToolTip("Send message")
+        self.send_btn.clicked.connect(self._on_send)
+
+        input_row.addWidget(self.text_input, stretch=1)
+        input_row.addWidget(self.mic_btn)
+        input_row.addWidget(self.send_btn)
+        layout.addLayout(input_row)
+
+        return panel
+
+    # ── Signal wiring ─────────────────────────────────────────────────────────
 
     def _connect_signals(self):
         self.signals.avatar_frames.connect(self._start_playback)
-        self.signals.status.connect(self._status)
+        self.signals.status.connect(self._update_status)
         self.signals.play_audio.connect(
             lambda p: self.voice.play_audio_nonblocking(p))
+        self.signals.speak_audio_only.connect(self._play_audio_only)
+        self.signals.lipsync_ready.connect(self._on_lipsync_ready)
         self.signals.greeting_ready.connect(self._on_greeting_ready)
+        self.signals.bot_message.connect(
+            lambda t: self._add_chat_bubble(t, is_user=False))
+        self.signals.system_message.connect(self._add_system_message)
+        self.signals.enable_input.connect(self._enable_input)
+        self.signals.transcription_done.connect(self._on_transcription)
 
         self.frame_timer = QTimer()
         self.frame_timer.timeout.connect(self._next_frame)
 
         self._think_frames = self.av_eng.get_thinking_frames()
-        self._think_idx    = 0
-        self.think_timer   = QTimer()
+        self._think_idx = 0
+        self.think_timer = QTimer()
         self.think_timer.timeout.connect(self._thinking_frame)
 
-    # Greeting
+        self._audio_done_timer = QTimer()
+        self._audio_done_timer.setSingleShot(True)
+        self._audio_done_timer.timeout.connect(self._on_audio_only_done)
+
+    # ── Startup info ──────────────────────────────────────────────────────────
+
+    def _show_startup_info(self):
+        kb_count = self.kb.doc_count()
+        if kb_count:
+            self._add_system_message(
+                f"Knowledge base loaded: {kb_count} applications")
+        else:
+            self._add_system_message("⚠ No knowledge base data found")
+
+        if self.llm.is_available():
+            self._add_system_message(
+                f"Connected to Ollama (model: {OLLAMA_MODEL})")
+        else:
+            self._add_system_message(
+                "⚠ Ollama not reachable — start Ollama and restart the app")
+
+    # ── Greeting ──────────────────────────────────────────────────────────────
+
     def _prepare_greeting(self):
         self._start_thinking_animation()
 
         cached = (os.path.isfile(GREETING_VIDEO_CACHE)
                   and os.path.isfile(GREETING_AUDIO_CACHE))
         if cached:
-            self._status("Loading greeting …")
+            self._update_status("Loading greeting …")
         else:
-            self._status("Generating greeting (first time, ~30s) …")
+            self._update_status("Generating greeting (first time, ~30s) …")
 
         def _worker():
             try:
@@ -176,34 +425,298 @@ class MainWindow(QMainWindow):
                     self._greeting_audio = audio_path
                     self.signals.greeting_ready.emit()
                 else:
-                    self.signals.play_audio.emit(audio_path)
-                    self.signals.status.emit("Ready")
+                    if audio_path and os.path.isfile(audio_path):
+                        self.signals.speak_audio_only.emit(audio_path)
+                    else:
+                        self.signals.status.emit("Ready")
             except Exception as e:
                 log.error("Greeting failed: %s", e)
                 self.signals.status.emit("Ready")
+
+            self.signals.bot_message.emit(GREETING_TEXT)
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_greeting_ready(self):
         if self._greeting_frames:
             self._start_playback(
-                self._greeting_frames,
-                self._greeting_fps,
-                self._greeting_audio
-            )
+                self._greeting_frames, self._greeting_fps,
+                self._greeting_audio)
             self.replay_btn.setEnabled(True)
 
-    def _replay_greeting(self):
-        if self._is_speaking:
+    # ── Replay (greeting or last response) ────────────────────────────────────
+
+    def _replay(self):
+        if self._is_speaking or self._is_processing:
+            return
+        if self._last_response_frames and self._last_response_audio:
+            self._start_playback(
+                self._last_response_frames,
+                self._last_response_fps,
+                self._last_response_audio)
             return
         if self._greeting_frames and self._greeting_audio:
             self._start_playback(
-                self._greeting_frames,
-                self._greeting_fps,
-                self._greeting_audio
-            )
+                self._greeting_frames, self._greeting_fps,
+                self._greeting_audio)
 
-    # Avatar frame playback 
+    # ── User input handling ───────────────────────────────────────────────────
+
+    def _on_send(self):
+        text = self.text_input.text().strip()
+        if not text or self._is_processing:
+            return
+        self.text_input.clear()
+        self._add_chat_bubble(text, is_user=True)
+        self._process_query(text)
+
+    def _toggle_recording(self):
+        if self._is_processing:
+            return
+        if self._is_recording:
+            self._stop_recording()
+        else:
+            self._start_mic_recording()
+
+    def _start_mic_recording(self):
+        self._is_recording = True
+        self.mic_btn.setText("⏹")
+        self.mic_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #c0392b; color: #fff;
+                border: none; border-radius: 10px; font-size: 16px;
+            }}
+            QPushButton:hover {{ background: #e74c3c; }}
+        """)
+        self._set_dot("● Recording …", "#e74c3c")
+        self.voice.start_recording()
+
+    def _stop_recording(self):
+        self._is_recording = False
+        self.mic_btn.setText("🎤")
+        self.mic_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLOR_CARD}; color: {COLOR_TEXT};
+                border: 1px solid {COLOR_BORDER}; border-radius: 10px;
+                font-size: 16px;
+            }}
+            QPushButton:hover {{ background: {COLOR_ACCENT}; color: #fff; }}
+        """)
+        self._set_dot("● Transcribing …", "#e67e22")
+
+        audio_path = self.voice.stop_recording()
+        if not audio_path:
+            self._set_dot("● Idle", COLOR_SUBTEXT)
+            return
+
+        self._disable_input()
+
+        def _transcribe():
+            text = self.voice.transcribe(audio_path)
+            if text:
+                self.signals.transcription_done.emit(text)
+            else:
+                self.signals.system_message.emit(
+                    "Could not transcribe audio — please try again.")
+                self.signals.enable_input.emit()
+
+        threading.Thread(target=_transcribe, daemon=True).start()
+
+    def _on_transcription(self, text: str):
+        self._add_chat_bubble(text, is_user=True)
+        self._process_query(text)
+
+    # ── Response pipeline (async: audio-first, lip-sync in background) ────────
+
+    def _process_query(self, question: str):
+        self._is_processing = True
+        self._query_id += 1
+        current_query_id = self._query_id
+
+        self._disable_input()
+        self._start_thinking_animation()
+        self._set_dot("● Thinking …", "#e67e22")
+        self._update_status("Querying knowledge base …")
+
+        def _worker():
+            audio_path = None
+            try:
+                # ── Phase 1: Fast path ────────────────────────────────────
+                context_docs = self.kb.query(question, top_k=5)
+
+                self.signals.status.emit("Generating response …")
+                response_text = self.llm.generate_response(
+                    question, context_docs)
+                self.signals.bot_message.emit(response_text)
+
+                self.signals.status.emit("Synthesizing speech …")
+                audio_path = self.voice.synthesize(response_text)
+
+                self._last_response_audio = audio_path
+                self._last_response_frames = []
+                self._last_response_fps = 25.0
+
+                # Check lip-sync cache — instant playback if available
+                if ENABLE_LIPSYNC and self.av_eng.wav2lip_available:
+                    cached = self.av_eng.get_cached_video(audio_path)
+                    if cached:
+                        frames = self.av_eng.extract_frames(cached)
+                        fps = self.av_eng.get_video_fps(cached)
+                        self._last_response_frames = frames
+                        self._last_response_fps = fps
+                        self.signals.avatar_frames.emit(
+                            frames, fps, audio_path)
+                        self._is_processing = False
+                        self.signals.enable_input.emit()
+                        self._update_replay_btn()
+                        return
+
+                # No cache — play audio immediately with speaking glow
+                if audio_path and os.path.isfile(audio_path):
+                    self.signals.speak_audio_only.emit(audio_path)
+                else:
+                    self.signals.status.emit("Ready")
+
+                self._is_processing = False
+                self.signals.enable_input.emit()
+
+            except Exception as exc:
+                log.error("Pipeline error: %s", exc)
+                self.signals.bot_message.emit(
+                    f"Sorry, an error occurred: {exc}")
+                self.signals.status.emit("Ready")
+                self._is_processing = False
+                self.signals.enable_input.emit()
+                return
+
+            # ── Phase 2: Background lip-sync generation ───────────────
+            if (not ENABLE_LIPSYNC
+                    or not self.av_eng.wav2lip_available
+                    or not audio_path):
+                return
+
+            if self._query_id != current_query_id:
+                log.info("Skipping stale lip-sync (query %d superseded).",
+                         current_query_id)
+                return
+
+            try:
+                video_path = \
+                    self.av_eng.generate_talking_video_cached(audio_path)
+                if not video_path:
+                    return
+
+                if self._query_id != current_query_id:
+                    return
+
+                frames = self.av_eng.extract_frames(video_path)
+                fps = self.av_eng.get_video_fps(video_path)
+                self._last_response_frames = frames
+                self._last_response_fps = fps
+                self.signals.lipsync_ready.emit(frames, fps)
+
+            except Exception as exc:
+                log.warning("Background lip-sync failed: %s", exc)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ── Audio-only playback (Phase 1 — immediate) ─────────────────────────────
+
+    def _play_audio_only(self, audio_path: str):
+        self.think_timer.stop()
+        self._set_speaking_style(True)
+        self._set_dot("● Speaking", "#27ae60")
+        self._update_status("Speaking …")
+
+        self._audio_only_playing = True
+        self._audio_start_time = time.time()
+
+        self.voice.play_audio_nonblocking(audio_path)
+
+        try:
+            with _wave.open(audio_path, "rb") as wf:
+                self._audio_duration_ms = int(
+                    wf.getnframes() / wf.getframerate() * 1000)
+        except Exception:
+            self._audio_duration_ms = 5000
+
+        self._audio_done_timer.start(self._audio_duration_ms + 500)
+
+    def _on_audio_only_done(self):
+        self._audio_only_playing = False
+        if not self._is_speaking:
+            self.avatar_label.setPixmap(self.av_eng.get_idle_pixmap())
+            self._set_speaking_style(False)
+            self._set_dot("● Idle", COLOR_SUBTEXT)
+            self._update_status("Ready")
+            self._update_replay_btn()
+
+    # ── Mid-playback lip-sync switch (Phase 2 delivers frames) ────────────────
+
+    def _on_lipsync_ready(self, frames: list, fps: float):
+        if not frames:
+            return
+
+        if self._audio_only_playing:
+            elapsed_s = time.time() - self._audio_start_time
+            frame_offset = int(elapsed_s * fps)
+
+            if frame_offset < len(frames):
+                self._audio_done_timer.stop()
+                self._audio_only_playing = False
+                self._is_speaking = True
+                self._frames = frames
+                self._frame_idx = frame_offset
+                interval = max(1, int(1000 / fps))
+                self.frame_timer.start(interval)
+                log.info("Switched to lip-sync at frame %d/%d",
+                         frame_offset, len(frames))
+                return
+
+        self._update_replay_btn()
+
+    # ── Replay button ─────────────────────────────────────────────────────────
+
+    def _update_replay_btn(self):
+        if self._last_response_frames and self._last_response_audio:
+            self.replay_btn.setText("▶  Replay Last Response")
+            self.replay_btn.setEnabled(True)
+        elif self._greeting_frames and self._greeting_audio:
+            self.replay_btn.setText("▶  Replay Greeting")
+            self.replay_btn.setEnabled(True)
+
+    # ── Chat display ──────────────────────────────────────────────────────────
+
+    def _add_chat_bubble(self, text: str, is_user: bool = False):
+        bubble = ChatBubble(text, is_user)
+        self.chat_layout.addWidget(bubble)
+        QTimer.singleShot(50, self._scroll_chat_to_bottom)
+
+    def _add_system_message(self, text: str):
+        msg = SystemMessage(text)
+        self.chat_layout.addWidget(msg)
+        QTimer.singleShot(50, self._scroll_chat_to_bottom)
+
+    def _scroll_chat_to_bottom(self):
+        vbar = self.chat_scroll.verticalScrollBar()
+        vbar.setValue(vbar.maximum())
+
+    # ── Input enable / disable ────────────────────────────────────────────────
+
+    def _disable_input(self):
+        self.text_input.setEnabled(False)
+        self.send_btn.setEnabled(False)
+        if self.voice.mic_available:
+            self.mic_btn.setEnabled(False)
+
+    def _enable_input(self):
+        self.text_input.setEnabled(True)
+        self.send_btn.setEnabled(True)
+        if self.voice.mic_available:
+            self.mic_btn.setEnabled(True)
+        self.text_input.setFocus()
+
+    # ── Avatar frame playback ─────────────────────────────────────────────────
 
     def _start_thinking_animation(self):
         self._think_idx = 0
@@ -217,17 +730,15 @@ class MainWindow(QMainWindow):
 
     def _set_speaking_style(self, speaking: bool):
         if speaking:
-            self.avatar_label.setStyleSheet(f"""
-                border: 3px solid #27ae60; border-radius: 16px;
-                background: {COLOR_CARD};
-            """)
+            self.avatar_label.setStyleSheet(
+                f"border: 3px solid #27ae60; border-radius: 14px; "
+                f"background: {COLOR_CARD};")
             self._avatar_glow.setColor(QColor("#27ae60"))
             self._avatar_glow.setBlurRadius(50)
         else:
-            self.avatar_label.setStyleSheet(f"""
-                border: 2px solid {COLOR_BORDER}; border-radius: 16px;
-                background: {COLOR_CARD};
-            """)
+            self.avatar_label.setStyleSheet(
+                f"border: 2px solid {COLOR_BORDER}; border-radius: 14px; "
+                f"background: {COLOR_CARD};")
             self._avatar_glow.setColor(QColor(COLOR_ACCENT))
             self._avatar_glow.setBlurRadius(30)
 
@@ -235,14 +746,16 @@ class MainWindow(QMainWindow):
         if not frames:
             return
         self._is_speaking = True
+        self._audio_only_playing = False
+        self._audio_done_timer.stop()
         self.think_timer.stop()
-        self._frames    = frames
+        self._frames = frames
         self._frame_idx = 0
         interval = max(1, int(1000 / fps))
 
         self._set_speaking_style(True)
         self._set_dot("● Speaking", "#27ae60")
-        self._status("Speaking …")
+        self._update_status("Speaking …")
 
         if audio_path and os.path.isfile(audio_path):
             self.voice.play_audio_nonblocking(audio_path)
@@ -256,14 +769,15 @@ class MainWindow(QMainWindow):
             self.avatar_label.setPixmap(self.av_eng.get_idle_pixmap())
             self._set_speaking_style(False)
             self._set_dot("● Idle", COLOR_SUBTEXT)
-            self._status("Ready")
+            self._update_status("Ready")
+            self._update_replay_btn()
             return
         self.avatar_label.setPixmap(self._frames[self._frame_idx])
         self._frame_idx += 1
 
-    # Helpers
+    # ── Status helpers ────────────────────────────────────────────────────────
 
-    def _status(self, msg: str):
+    def _update_status(self, msg: str):
         self.status_bar.showMessage(msg)
         dot_map = {
             "speak":    ("● Speaking", "#27ae60"),
@@ -271,6 +785,11 @@ class MainWindow(QMainWindow):
             "generat":  ("● Generating …", "#e67e22"),
             "loading":  ("● Loading …", "#e67e22"),
             "initial":  ("● Initializing …", COLOR_ACCENT),
+            "think":    ("● Thinking …", "#e67e22"),
+            "query":    ("● Thinking …", "#e67e22"),
+            "synthe":   ("● Generating …", "#e67e22"),
+            "lip":      ("● Generating …", "#e67e22"),
+            "transcri": ("● Transcribing …", "#e67e22"),
         }
         key = msg.lower()
         for k, (label, color) in dot_map.items():
@@ -280,10 +799,12 @@ class MainWindow(QMainWindow):
 
     def _set_dot(self, label: str, color: str):
         self.status_dot.setText(label)
-        self.status_dot.setStyleSheet(f"color: {color}; font-size: 13px;")
+        self.status_dot.setStyleSheet(
+            f"color: {color}; font-size: 12px; background: transparent;")
 
 
-# Entry point 
+# ── Entry point ───────────────────────────────────────────────────────────────
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")

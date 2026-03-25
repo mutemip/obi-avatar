@@ -6,6 +6,7 @@ a sequence of QPixmap frames that the Qt UI can display.
 Wav2Lip pipeline:
   avatar.png  +  response.wav  ->  [Wav2Lip]  ->  output.mp4  ->  frames
 """
+import hashlib
 import logging
 import os
 import subprocess
@@ -23,11 +24,16 @@ from config import (AVATAR_IMAGE, WAV2LIP_DIR, WAV2LIP_CHECKPOINT,
 log = logging.getLogger(__name__)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+CACHE_DIR = os.path.join(TEMP_DIR, "cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 
 class AvatarEngine:
     def __init__(self):
         self.wav2lip_available = self._check_wav2lip()
         self.static_frame = self._load_static_avatar()
+        self._video_cache: dict[str, str] = {}
+        self._scan_cache()
 
     def _check_wav2lip(self) -> bool:
         inference = os.path.join(WAV2LIP_DIR, "inference.py")
@@ -70,7 +76,7 @@ class AvatarEngine:
     def _wav2lip_env(self) -> dict:
         """Build an env dict that puts ffmpeg on PATH for Wav2Lip subprocess."""
         env = os.environ.copy()
-        ffmpeg_dir = os.path.dirname(FFMPEG_BIN) if FFMPEG_BIN else ""
+        ffmpeg_dir = self._ensure_ffmpeg_symlink()
         if FROZEN:
             from config import BASE_DIR
             env["PATH"] = (BASE_DIR + os.pathsep +
@@ -82,6 +88,68 @@ class AvatarEngine:
                            ffmpeg_dir + os.pathsep +
                            env.get("PATH", ""))
         return env
+
+    @staticmethod
+    def _ensure_ffmpeg_symlink() -> str:
+        """If the ffmpeg binary has a non-standard name (e.g. imageio-ffmpeg),
+        create a 'ffmpeg' symlink in TEMP_DIR so shell commands can find it."""
+        if not FFMPEG_BIN or not os.path.isfile(FFMPEG_BIN):
+            return ""
+        if os.path.basename(FFMPEG_BIN) == "ffmpeg":
+            return os.path.dirname(FFMPEG_BIN)
+
+        link = os.path.join(TEMP_DIR, "ffmpeg")
+        try:
+            if os.path.islink(link) or os.path.exists(link):
+                os.remove(link)
+            os.symlink(FFMPEG_BIN, link)
+        except OSError as exc:
+            log.warning("Could not create ffmpeg symlink: %s", exc)
+            return os.path.dirname(FFMPEG_BIN)
+        return TEMP_DIR
+
+    # ── Video cache ────────────────────────────────────────────────────────
+
+    def _scan_cache(self):
+        for fname in os.listdir(CACHE_DIR):
+            if fname.endswith(".mp4"):
+                key = fname[:-4]
+                self._video_cache[key] = os.path.join(CACHE_DIR, fname)
+        if self._video_cache:
+            log.info("Loaded %d cached lip-sync videos.", len(self._video_cache))
+
+    @staticmethod
+    def _audio_hash(audio_path: str) -> str:
+        h = hashlib.md5(usedforsecurity=False)
+        with open(audio_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def get_cached_video(self, audio_path: str) -> str | None:
+        key = self._audio_hash(audio_path)
+        path = self._video_cache.get(key)
+        if path and os.path.isfile(path):
+            log.info("Cache hit for lip-sync video: %s", path)
+            return path
+        return None
+
+    def generate_talking_video_cached(self, audio_path: str,
+                                      resize_factor: int = 0) -> str:
+        """Generate lip-sync video, checking cache first and storing result."""
+        cached = self.get_cached_video(audio_path)
+        if cached:
+            return cached
+
+        key = self._audio_hash(audio_path)
+        out_path = os.path.join(CACHE_DIR, f"{key}.mp4")
+        result = self.generate_talking_video(
+            audio_path, out_path=out_path, resize_factor=resize_factor)
+        if result:
+            self._video_cache[key] = result
+        return result
+
+    # ── Wav2Lip generation ────────────────────────────────────────────────
 
     def generate_talking_video(self, audio_path: str,
                                out_path: str = None,

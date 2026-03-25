@@ -1,7 +1,9 @@
 """
 voice_engine.py
 Text-to-speech  : edge-tts  (Microsoft neural voices, free)
-Audio playback  : winsound (Windows) / aplay (Linux)
+Speech-to-text  : faster-whisper  (local Whisper via CTranslate2)
+Audio playback  : sounddevice / winsound / aplay / ffplay
+Mic recording   : sounddevice
 """
 import asyncio
 import io
@@ -12,29 +14,39 @@ import shutil
 import subprocess
 import sys
 import threading
+import wave
 
 import numpy as np
 import edge_tts
 
-from config import TTS_VOICE, TEMP_DIR, FFMPEG_BIN
+from config import TTS_VOICE, TEMP_DIR, FFMPEG_BIN, WHISPER_MODEL_SIZE
 
 log = logging.getLogger(__name__)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 _IS_WINDOWS = platform.system() == "Windows"
 
+# ── Optional dependency detection ─────────────────────────────────────────────
+
 try:
     import sounddevice as sd
     _HAS_SOUNDDEVICE = True
 except (ImportError, OSError) as e:
     _HAS_SOUNDDEVICE = False
-    log.warning("sounddevice unavailable (%s). Microphone recording disabled.", e)
+    log.warning("sounddevice unavailable (%s). Mic recording and playback disabled.", e)
 
 try:
     import soundfile as sf
     _HAS_SOUNDFILE = True
 except (ImportError, OSError):
     _HAS_SOUNDFILE = False
+
+_HAS_WHISPER = False
+try:
+    from faster_whisper import WhisperModel as _WhisperModel
+    _HAS_WHISPER = True
+except ImportError:
+    log.warning("faster-whisper not installed — speech-to-text disabled.")
 
 _APLAY  = shutil.which("aplay")
 _PAPLAY = shutil.which("paplay")
@@ -46,12 +58,25 @@ if _IS_WINDOWS:
 class VoiceEngine:
     def __init__(self):
         self._playback_proc = None
-        log.info("VoiceEngine ready (aplay=%s, windows=%s).",
-                 _APLAY is not None, _IS_WINDOWS)
 
-    # TTS
+        # Mic recording state
+        self._recording = False
+        self._audio_chunks: list[np.ndarray] = []
+        self._stream = None
+        self._sample_rate = 16_000
 
-    def synthesize(self, text: str, out_path: str = None) -> str:
+        # Whisper model (lazy-loaded on first transcription)
+        self._whisper: _WhisperModel | None = None
+
+        log.info(
+            "VoiceEngine ready (aplay=%s, windows=%s, mic=%s, stt=%s).",
+            _APLAY is not None, _IS_WINDOWS,
+            _HAS_SOUNDDEVICE, _HAS_WHISPER,
+        )
+
+    # ── TTS ───────────────────────────────────────────────────────────────────
+
+    def synthesize(self, text: str, out_path: str | None = None) -> str:
         if out_path is None:
             out_path = os.path.join(TEMP_DIR, "response.wav")
 
@@ -100,10 +125,81 @@ class VoiceEngine:
             log.warning("ffmpeg conversion failed: %s", e)
         return False
 
-    # Playback 
+    # ── Mic recording ─────────────────────────────────────────────────────────
+
+    @property
+    def mic_available(self) -> bool:
+        return _HAS_SOUNDDEVICE
+
+    @property
+    def stt_available(self) -> bool:
+        return _HAS_WHISPER
+
+    def start_recording(self):
+        if not _HAS_SOUNDDEVICE:
+            log.error("Cannot record — sounddevice not available.")
+            return
+        self._audio_chunks = []
+        self._recording = True
+
+        def _callback(indata, _frames, _time, _status):
+            if self._recording:
+                self._audio_chunks.append(indata.copy())
+
+        self._stream = sd.InputStream(
+            samplerate=self._sample_rate,
+            channels=1,
+            dtype="int16",
+            callback=_callback,
+        )
+        self._stream.start()
+        log.info("Mic recording started.")
+
+    def stop_recording(self) -> str:
+        self._recording = False
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+
+        if not self._audio_chunks:
+            log.warning("No audio captured.")
+            return ""
+
+        audio = np.concatenate(self._audio_chunks, axis=0)
+        out_path = os.path.join(TEMP_DIR, "mic_recording.wav")
+        with wave.open(out_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self._sample_rate)
+            wf.writeframes(audio.tobytes())
+
+        log.info("Mic recording saved to %s (%d samples).", out_path, len(audio))
+        return out_path
+
+    # ── Speech-to-text ────────────────────────────────────────────────────────
+
+    def transcribe(self, audio_path: str) -> str:
+        if not _HAS_WHISPER:
+            log.error("faster-whisper not installed — cannot transcribe.")
+            return ""
+        if not os.path.isfile(audio_path):
+            return ""
+
+        if self._whisper is None:
+            log.info("Loading Whisper model '%s' (first use)…", WHISPER_MODEL_SIZE)
+            self._whisper = _WhisperModel(
+                WHISPER_MODEL_SIZE, device="cpu", compute_type="int8"
+            )
+
+        segments, _info = self._whisper.transcribe(audio_path, beam_size=5)
+        text = " ".join(seg.text for seg in segments).strip()
+        log.info("Transcription: %s", text)
+        return text
+
+    # ── Playback ──────────────────────────────────────────────────────────────
 
     def play_audio_nonblocking(self, path: str):
-        """Start audio playback (non-blocking). Returns immediately."""
         self.stop_playback()
         abs_path = os.path.abspath(path)
 
