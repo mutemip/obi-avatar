@@ -12,21 +12,27 @@ log = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT_TEMPLATE = """\
 You are Obi, an AI-powered observability assistant for enterprise application \
-monitoring. You help users understand their application portfolio's health, \
-risk levels, incident response times, and monitoring gaps.
+monitoring.
 
 {kb_summary_block}
 
-Guidelines:
-- When context documents are provided, use them to give specific, \
-data-driven answers. Reference application names, IDs, tiers, risk scores, \
-and TTR values.
-- Keep responses concise (2–4 sentences) because they will be spoken aloud \
+STRICT RULES — you MUST follow these without exception:
+1. ONLY answer questions using data from the knowledge-base context provided \
+below. Do NOT use any outside knowledge, do NOT guess, and do NOT fabricate \
+data.
+2. If the user's question cannot be answered from the provided context, \
+respond ONLY with: "I don't have that information in my knowledge base. \
+I can only answer questions about the applications in our observability \
+portfolio."
+3. Never invent application names, IDs, metrics, or statistics that are not \
+present in the context documents.
+4. When answering, cite specific values from the context: application names, \
+IDs, tiers, Incident TTR, Monitoring Level, and Observability Risk Score.
+5. Keep responses concise (2–4 sentences) because they will be spoken aloud \
 by a lip-synced avatar.
-- Be proactive: suggest improvements such as upgrading monitoring for \
-high-risk or high-TTR applications.
-- If the question cannot be answered from the knowledge base, say so clearly.
-- Use a professional but friendly tone.\
+6. Be proactive: if the data shows a concern (high risk score, high TTR, \
+basic monitoring on a critical tier), mention it.
+7. Use a professional but friendly tone.\
 """
 
 
@@ -84,6 +90,39 @@ class LLMEngine:
         except Exception as exc:
             log.error("Ollama generation error: %s", exc)
             return f"Sorry, I encountered an error generating a response: {exc}"
+
+    def generate_response_stream(self, user_query: str,
+                                 context_docs: List[str]):
+        """Yield tokens as they arrive from Ollama (streaming mode)."""
+        if not self._available:
+            yield ("I'm unable to reach the Ollama server. "
+                   "Please make sure Ollama is running and try again.")
+            return
+
+        context_block = "\n".join(f"• {d}" for d in context_docs) \
+            if context_docs else "No relevant documents found."
+
+        user_content = (
+            f"Relevant knowledge-base context:\n{context_block}\n\n"
+            f"User question: {user_query}"
+        )
+
+        try:
+            stream = self._client.chat(
+                model=OLLAMA_MODEL,
+                messages=[
+                    {"role": "system", "content": self._system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                stream=True,
+            )
+            for chunk in stream:
+                token = chunk.get("message", {}).get("content", "")
+                if token:
+                    yield token
+        except Exception as exc:
+            log.error("Ollama streaming error: %s", exc)
+            yield f"Sorry, I encountered an error: {exc}"
 
     # ── Internals 
 

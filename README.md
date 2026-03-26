@@ -4,9 +4,11 @@ A desktop AI assistant with a lip-synced talking avatar that answers questions a
 
 ## Features
 
+- **Streaming responses** — LLM tokens stream to the chat bubble in real time; audio starts playing as soon as the first sentence is ready
+- **Sentence-by-sentence TTS + lip-sync** — each sentence is independently synthesized and lip-synced in parallel, reducing perceived latency
 - **RAG Knowledge Base** — loads CSV data, embeds with Ollama, and retrieves relevant context for every query
 - **Local LLM** — powered by Ollama (no cloud APIs, fully offline capable)
-- **Lip-synced Avatar** — Wav2Lip generates talking-head video for each response
+- **Lip-synced Avatar** — Wav2Lip generates talking-head video for each sentence; swaps in mid-playback when ready
 - **Voice Input** — speech-to-text via faster-whisper (click the mic button)
 - **Text Input** — standard chat interface
 - **Neural TTS** — Microsoft Edge neural voices via edge-tts
@@ -97,7 +99,7 @@ All settings are in `config.py`:
         └── wav2lip_gan.pth
 ```
 
-## Architecture
+## Architecture — Streaming Pipeline
 
 ```
 User Query (text or voice)
@@ -106,13 +108,17 @@ User Query (text or voice)
     │
     ├─► [KnowledgeBase]   Embed query → cosine similarity → top-k docs
     │
-    ├─► [Ollama LLM]      System prompt + KB summary + context docs → response
+    ├─► [Ollama LLM]      Streams tokens to chat bubble in real time
+    │         │
+    │         ├─► Sentence 1 detected → [edge-tts] → play audio immediately
+    │         │                           └─► [Wav2Lip] → swap in lip-sync mid-playback
+    │         │
+    │         ├─► Sentence 2 detected → [edge-tts] → queue behind sentence 1
+    │         │                           └─► [Wav2Lip] → parallel generation
+    │         │
+    │         └─► Sentence N …
     │
-    ├─► [edge-tts]        Response text → speech audio (WAV)
-    │
-    ├─► [Wav2Lip]         Avatar image + audio → lip-synced video
-    │
-    └─► [PyQt5 UI]        Play video frames + audio in sync
+    └─► [PyQt5 UI]        Seamless sentence-by-sentence playback
 ```
 
 ## Changing the LLM or Knowledge Base

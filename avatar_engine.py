@@ -27,6 +27,8 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 CACHE_DIR = os.path.join(TEMP_DIR, "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+MAX_CACHE_VIDEOS = 50
+
 
 class AvatarEngine:
     def __init__(self):
@@ -34,6 +36,7 @@ class AvatarEngine:
         self.static_frame = self._load_static_avatar()
         self._video_cache: dict[str, str] = {}
         self._scan_cache()
+        self._evict_cache()
 
     def _check_wav2lip(self) -> bool:
         inference = os.path.join(WAV2LIP_DIR, "inference.py")
@@ -118,6 +121,24 @@ class AvatarEngine:
         if self._video_cache:
             log.info("Loaded %d cached lip-sync videos.", len(self._video_cache))
 
+    def _evict_cache(self):
+        """Remove oldest cached videos when exceeding MAX_CACHE_VIDEOS."""
+        if len(self._video_cache) <= MAX_CACHE_VIDEOS:
+            return
+        by_mtime = sorted(
+            self._video_cache.items(),
+            key=lambda kv: os.path.getmtime(kv[1]) if os.path.isfile(kv[1]) else 0,
+        )
+        to_remove = len(self._video_cache) - MAX_CACHE_VIDEOS
+        for key, path in by_mtime[:to_remove]:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            del self._video_cache[key]
+        log.info("Evicted %d cached videos (cap=%d).",
+                 to_remove, MAX_CACHE_VIDEOS)
+
     @staticmethod
     def _audio_hash(audio_path: str) -> str:
         h = hashlib.md5(usedforsecurity=False)
@@ -135,7 +156,7 @@ class AvatarEngine:
         return None
 
     def generate_talking_video_cached(self, audio_path: str,
-                                      resize_factor: int = 0) -> str:
+                                      resize_factor: int = 2) -> str:
         """Generate lip-sync video, checking cache first and storing result."""
         cached = self.get_cached_video(audio_path)
         if cached:
@@ -147,13 +168,14 @@ class AvatarEngine:
             audio_path, out_path=out_path, resize_factor=resize_factor)
         if result:
             self._video_cache[key] = result
+            self._evict_cache()
         return result
 
     # ── Wav2Lip generation ────────────────────────────────────────────────
 
     def generate_talking_video(self, audio_path: str,
                                out_path: str = None,
-                               resize_factor: int = 0) -> str:
+                               resize_factor: int = 2) -> str:
         if not self.wav2lip_available:
             log.warning("Wav2Lip unavailable — skipping lip-sync generation.")
             return ""
@@ -176,12 +198,19 @@ class AvatarEngine:
         if resize_factor > 1:
             cmd.extend(["--resize_factor", str(resize_factor)])
 
+        def _low_priority():
+            try:
+                os.nice(10)
+            except OSError:
+                pass
+
         log.info("Running Wav2Lip: %s", " ".join(cmd))
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
                 cwd=WAV2LIP_DIR, timeout=300,
                 env=self._wav2lip_env(),
+                preexec_fn=_low_priority,
             )
             if result.returncode != 0:
                 log.error("Wav2Lip stdout:\n%s", result.stdout[-2000:])
@@ -201,19 +230,28 @@ class AvatarEngine:
         return ""
 
     def extract_frames(self, video_path: str) -> list:
+        """Extract frames as QPixmaps. MAIN THREAD ONLY."""
+        return self.qimages_to_pixmaps(
+            self.extract_frames_as_qimages(video_path))
+
+    def extract_frames_as_qimages(self, video_path: str) -> list:
+        """Extract frames as QImages (thread-safe)."""
         if not video_path or not os.path.isfile(video_path):
             return []
-
-        frames = []
+        images = []
         cap = cv2.VideoCapture(video_path)
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            frames.append(self._cv2_to_pixmap(frame))
+            images.append(self._cv2_to_qimage(frame))
         cap.release()
-        log.info("Extracted %d frames from %s", len(frames), video_path)
-        return frames
+        log.info("Extracted %d frames from %s", len(images), video_path)
+        return images
+
+    def qimages_to_pixmaps(self, images: list) -> list:
+        """Convert QImages to scaled QPixmaps. MAIN THREAD ONLY."""
+        return [self._qimage_to_pixmap(img) for img in images]
 
     def get_video_fps(self, video_path: str) -> float:
         if not video_path or not os.path.isfile(video_path):
@@ -224,13 +262,35 @@ class AvatarEngine:
         return fps
 
     @staticmethod
+    def _cv2_to_qimage(frame: np.ndarray) -> QImage:
+        """Convert cv2 BGR frame to QImage (thread-safe)."""
+        if frame is None:
+            return QImage()
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+        return QImage(rgb.data, w, h, bytes_per_line,
+                      QImage.Format_RGB888).copy()
+
+    @staticmethod
+    def _qimage_to_pixmap(qimg: QImage) -> QPixmap:
+        """Convert QImage to scaled QPixmap. MAIN THREAD ONLY."""
+        pix = QPixmap.fromImage(qimg)
+        return pix.scaled(
+            AVATAR_DISPLAY_W, AVATAR_DISPLAY_H,
+            Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+
+    @staticmethod
     def _cv2_to_pixmap(frame: np.ndarray) -> QPixmap:
+        """Convert cv2 frame to QPixmap. MAIN THREAD ONLY."""
         if frame is None:
             return QPixmap()
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
-        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
+        qimg = QImage(rgb.data, w, h, bytes_per_line,
+                      QImage.Format_RGB888).copy()
         pix = QPixmap.fromImage(qimg)
         return pix.scaled(
             AVATAR_DISPLAY_W, AVATAR_DISPLAY_H,

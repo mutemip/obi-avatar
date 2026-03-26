@@ -214,17 +214,14 @@ class VoiceEngine:
             return
 
         if _HAS_SOUNDDEVICE and _HAS_SOUNDFILE:
-            def _sd_play():
-                try:
-                    data, sr = sf.read(abs_path, dtype="float32")
-                    sd.play(data, sr)
-                    sd.wait()
-                except Exception as e:
-                    log.debug("sounddevice playback failed: %s", e)
-                    self._subprocess_play_nonblocking(abs_path)
-            threading.Thread(target=_sd_play, daemon=True).start()
-            log.info("Audio playback started (sounddevice): %s", abs_path)
-            return
+            try:
+                data, sr = sf.read(abs_path, dtype="float32")
+                sd.play(data, sr)
+                log.info("Audio playback started (sounddevice): %s",
+                         abs_path)
+                return
+            except Exception as e:
+                log.debug("sounddevice playback failed: %s", e)
 
         self._subprocess_play_nonblocking(abs_path)
 
@@ -244,6 +241,11 @@ class VoiceEngine:
         log.error("No audio player available.")
 
     def stop_playback(self):
+        if _HAS_SOUNDDEVICE:
+            try:
+                sd.stop()
+            except Exception:
+                pass
         if self._playback_proc and self._playback_proc.poll() is None:
             self._playback_proc.terminate()
             self._playback_proc = None
