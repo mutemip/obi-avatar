@@ -60,8 +60,8 @@ KNOWLEDGE_BASE_PATH = os.path.join(BASE_DIR,
 
 # ─── Greeting 
 GREETING_TEXT = ("Hello! I'm Obi, your observability assistant. "
-                 "Ask me anything about your applications, risk scores, "
-                 "or monitoring levels.")
+                 "I will make you understand your applications, risk scores, "
+                 "and monitoring levels.")
 
 # ─── Voice / STT 
 TTS_VOICE          = "en-US-AriaNeural"
