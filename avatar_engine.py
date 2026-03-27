@@ -171,6 +171,30 @@ class AvatarEngine:
             self._evict_cache()
         return result
 
+    # ── Audio extraction from video ───────────────────────────────────────
+
+    def extract_audio_from_video(self, video_path: str,
+                                 out_path: str = None) -> str:
+        """Extract audio track from an .mp4 video to a .wav file."""
+        if not video_path or not os.path.isfile(video_path):
+            return ""
+        if out_path is None:
+            base = os.path.splitext(video_path)[0]
+            out_path = base + "_audio.wav"
+        try:
+            subprocess.run(
+                [FFMPEG_BIN, "-y", "-i", video_path,
+                 "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                 out_path],
+                capture_output=True, timeout=30, check=True,
+            )
+            if os.path.isfile(out_path):
+                log.info("Extracted audio from video: %s", out_path)
+                return out_path
+        except Exception as e:
+            log.warning("Audio extraction from video failed: %s", e)
+        return ""
+
     # ── Wav2Lip generation ────────────────────────────────────────────────
 
     def generate_talking_video(self, audio_path: str,

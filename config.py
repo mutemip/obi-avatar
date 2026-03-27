@@ -63,6 +63,8 @@ GREETING_TEXT = ("Hello! I'm Obi, your observability assistant. "
                  "I will make you understand your applications, risk scores, "
                  "and monitoring levels.")
 
+WAITING_TEXT = "Give me a Second to review this"
+
 # ─── Voice / STT 
 TTS_VOICE          = "en-US-AriaNeural"
 WHISPER_MODEL_SIZE = "base"

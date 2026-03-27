@@ -1,7 +1,9 @@
 """
 main.py — Obi — Observability AI Assistant — Desktop Application
 Two-panel layout: avatar (left) + chat with RAG (right).
-Async lip-sync: audio plays immediately, Wav2Lip runs in background.
+Whole-response lip-sync: LLM response is collected in full, then a
+single Wav2Lip video is generated and played with its own audio track.
+A "Give me a Second" waiting clip plays while the response generates.
 Run with:  python main.py
 """
 import logging
@@ -10,8 +12,6 @@ import re
 import sys
 import threading
 import time
-import wave as _wave
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
@@ -36,6 +36,8 @@ log = logging.getLogger(__name__)
 
 GREETING_AUDIO_CACHE = os.path.join(TEMP_DIR, "greeting_cached.wav")
 GREETING_VIDEO_CACHE = os.path.join(TEMP_DIR, "greeting_cached.mp4")
+WAITING_AUDIO_CACHE  = os.path.join(TEMP_DIR, "waiting_cached.wav")
+WAITING_VIDEO_CACHE  = os.path.join(TEMP_DIR, "waiting_cached.mp4")
 
 
 # ── Qt signals 
@@ -45,17 +47,15 @@ class Signals(QObject):
     status             = pyqtSignal(str)
     play_audio         = pyqtSignal(str)
     speak_audio_only   = pyqtSignal(str)
-    lipsync_ready      = pyqtSignal(list, float)
     greeting_ready     = pyqtSignal()
+    waiting_ready      = pyqtSignal()
     bot_message        = pyqtSignal(str)
     system_message     = pyqtSignal(str)
     enable_input       = pyqtSignal()
     transcription_done = pyqtSignal(str)
 
     bot_message_append       = pyqtSignal(str)
-    sentence_audio_ready     = pyqtSignal(int, str)
-    sentence_lipsync_ready   = pyqtSignal(int, list, float, str)
-    all_sentences_dispatched = pyqtSignal(int)
+    response_video_ready     = pyqtSignal()
 
 
 # ── Chat bubble widget 
@@ -133,11 +133,6 @@ class SystemMessage(QLabel):
         )
 
 
-# ── Sentence splitter for streaming pipeline 
-
-_SENTENCE_BOUNDARY = re.compile(r'(?<=[.!?])\s+(?=[A-Z"\'])')
-
-
 def _clean_for_tts(text: str) -> str:
     """Strip markdown formatting so TTS reads only words."""
     text = re.sub(r'\*+', '', text)
@@ -146,15 +141,6 @@ def _clean_for_tts(text: str) -> str:
     text = re.sub(r'`([^`]*)`', r'\1', text)
     text = re.sub(r'\s{2,}', ' ', text)
     return text.strip()
-
-
-def _extract_sentences(text: str):
-    """Split accumulated text into (complete_sentences, remainder).
-    Boundaries are .!? followed by whitespace and an uppercase letter."""
-    parts = _SENTENCE_BOUNDARY.split(text)
-    if len(parts) <= 1:
-        return [], text
-    return parts[:-1], parts[-1]
 
 
 # ── Main Window 
@@ -191,24 +177,24 @@ class MainWindow(QMainWindow):
         self._greeting_fps    = 25.0
         self._greeting_audio  = ""
 
+        # Waiting message cache ("Give me a Second to review this")
+        self._waiting_frames = []
+        self._waiting_fps    = 25.0
+        self._waiting_audio  = ""
+        self._waiting_video_playing = False
+
         # Last response cache (for replay)
         self._last_response_audio  = ""
         self._last_response_frames = []
         self._last_response_fps    = 25.0
-        self._last_response_sentences = []
+        self._last_response_video  = ""
 
-        # Streaming sentence pipeline
-        self._sentence_data = {}
-        self._next_play_idx = 0
-        self._total_sentence_count = None
-        self._current_bot_bubble = None
-        self._streaming_playback = False
-        self._current_sentence_playing_idx = -1
-
-        self._tts_pool = ThreadPoolExecutor(max_workers=2,
-                                            thread_name_prefix="tts")
-        self._w2l_pool = ThreadPoolExecutor(max_workers=1,
-                                            thread_name_prefix="w2l")
+        # Pending response video (built in background thread)
+        self._pending_response_frames = []
+        self._pending_response_fps    = 25.0
+        self._pending_response_audio  = ""
+        self._pending_response_video  = ""
+        self._current_bot_bubble      = None
 
         self._setup_ui()
         self._connect_signals()
@@ -411,8 +397,8 @@ class MainWindow(QMainWindow):
         self.signals.play_audio.connect(
             lambda p: self.voice.play_audio_nonblocking(p))
         self.signals.speak_audio_only.connect(self._play_audio_only)
-        self.signals.lipsync_ready.connect(self._on_lipsync_ready)
         self.signals.greeting_ready.connect(self._on_greeting_ready)
+        self.signals.waiting_ready.connect(self._on_waiting_ready)
         self.signals.bot_message.connect(
             lambda t: self._add_chat_bubble(t, is_user=False))
         self.signals.system_message.connect(self._add_system_message)
@@ -420,12 +406,8 @@ class MainWindow(QMainWindow):
         self.signals.transcription_done.connect(self._on_transcription)
 
         self.signals.bot_message_append.connect(self._append_to_bot_bubble)
-        self.signals.sentence_audio_ready.connect(
-            self._on_sentence_audio_ready)
-        self.signals.sentence_lipsync_ready.connect(
-            self._on_sentence_lipsync_ready)
-        self.signals.all_sentences_dispatched.connect(
-            self._on_all_sentences_dispatched)
+        self.signals.response_video_ready.connect(
+            self._on_response_video_ready)
 
         self.frame_timer = QTimer()
         self.frame_timer.timeout.connect(self._next_frame)
@@ -438,11 +420,6 @@ class MainWindow(QMainWindow):
         self._audio_done_timer = QTimer()
         self._audio_done_timer.setSingleShot(True)
         self._audio_done_timer.timeout.connect(self._on_audio_only_done)
-
-        self._sentence_done_timer = QTimer()
-        self._sentence_done_timer.setSingleShot(True)
-        self._sentence_done_timer.timeout.connect(
-            self._on_sentence_playback_done)
 
     # ── Startup info 
 
@@ -500,8 +477,45 @@ class MainWindow(QMainWindow):
                 self.signals.status.emit("Ready")
 
             self.signals.bot_message.emit(GREETING_TEXT)
+            self._prepare_waiting_message_bg()
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _prepare_waiting_message_bg(self):
+        """Pre-generate the waiting message video (runs in background thread)."""
+        cached = (os.path.isfile(WAITING_VIDEO_CACHE)
+                  and os.path.isfile(WAITING_AUDIO_CACHE))
+        try:
+            if cached:
+                audio_path = WAITING_AUDIO_CACHE
+                video_path = WAITING_VIDEO_CACHE
+            else:
+                log.info("Generating waiting message video (first time) …")
+                audio_path = self.voice.synthesize(
+                    WAITING_TEXT, out_path=WAITING_AUDIO_CACHE)
+                video_path = self.av_eng.generate_talking_video(
+                    audio_path, out_path=WAITING_VIDEO_CACHE)
+
+            if video_path and os.path.isfile(video_path):
+                self._waiting_frames = \
+                    self.av_eng.extract_frames_as_qimages(video_path)
+                self._waiting_fps = self.av_eng.get_video_fps(video_path)
+                video_audio = video_path.replace(".mp4", "_audio.wav")
+                extracted = self.av_eng.extract_audio_from_video(
+                    video_path, video_audio)
+                self._waiting_audio = extracted or audio_path
+                self.signals.waiting_ready.emit()
+            else:
+                log.warning("Waiting message video generation failed.")
+        except Exception as e:
+            log.error("Waiting message preparation failed: %s", e)
+
+    def _on_waiting_ready(self):
+        if self._waiting_frames:
+            self._waiting_frames = self.av_eng.qimages_to_pixmaps(
+                self._waiting_frames)
+        log.info("Waiting message ready (%d frames).",
+                 len(self._waiting_frames))
 
     def _on_greeting_ready(self):
         if self._greeting_frames:
@@ -512,25 +526,29 @@ class MainWindow(QMainWindow):
                 self._greeting_audio)
             self.replay_btn.setEnabled(True)
 
+    def _on_waiting_video_done(self):
+        """Waiting message finished — transition to response playback."""
+        self._waiting_video_playing = False
+        self._is_speaking = False
+        self.voice.stop_playback()
+
+        if self._pending_response_frames:
+            self._play_response_video()
+        else:
+            self._start_thinking_animation()
+            self._set_dot("● Generating …", "#e67e22")
+
     # ── Replay (greeting or last response)
 
     def _replay(self):
         if self._is_speaking or self._is_processing:
             return
 
-        if self._last_response_sentences:
-            self._sentence_data = {}
-            for i, entry in enumerate(self._last_response_sentences):
-                data = dict(entry)
-                video = data.get("video_path", "")
-                if video and os.path.isfile(video) and not data.get("frames"):
-                    data["frames"] = \
-                        self.av_eng.extract_frames_as_qimages(video)
-                self._sentence_data[i] = data
-            self._next_play_idx = 0
-            self._total_sentence_count = len(self._last_response_sentences)
-            self._streaming_playback = True
-            self._play_next_sentence()
+        if self._last_response_frames and self._last_response_audio:
+            self._start_playback(
+                list(self._last_response_frames),
+                self._last_response_fps,
+                self._last_response_audio)
             return
 
         if self._greeting_frames and self._greeting_audio:
@@ -604,18 +622,17 @@ class MainWindow(QMainWindow):
         self._add_chat_bubble(text, is_user=True)
         self._process_query(text)
 
-    # ── Response pipeline (streaming: sentence-by-sentence TTS + lip-sync) 
+    # ── Response pipeline (whole-response TTS + lip-sync) 
 
     def _stop_all_playback(self):
         """Stop any ongoing playback and reset state."""
         self.frame_timer.stop()
-        self._sentence_done_timer.stop()
         self._audio_done_timer.stop()
         self.think_timer.stop()
         self.voice.stop_playback()
         self._is_speaking = False
         self._audio_only_playing = False
-        self._streaming_playback = False
+        self._waiting_video_playing = False
 
     def _process_query(self, question: str):
         self._stop_all_playback()
@@ -625,20 +642,28 @@ class MainWindow(QMainWindow):
         qid = self._query_id
 
         self._disable_input()
-        self._start_thinking_animation()
-        self._set_dot("● Thinking …", "#e67e22")
-        self._update_status("Querying knowledge base …")
 
-        self._sentence_data = {}
-        self._next_play_idx = 0
-        self._total_sentence_count = None
-        self._current_sentence_playing_idx = -1
-        self._streaming_playback = True
+        self._pending_response_frames = []
+        self._pending_response_fps = 25.0
+        self._pending_response_audio = ""
+        self._pending_response_video = ""
 
         self._last_response_audio = ""
         self._last_response_frames = []
         self._last_response_fps = 25.0
-        self._last_response_sentences = []
+        self._last_response_video = ""
+
+        if (ENABLE_LIPSYNC and self.av_eng.wav2lip_available
+                and self._waiting_frames and self._waiting_audio):
+            self._waiting_video_playing = True
+            self._start_playback(
+                list(self._waiting_frames), self._waiting_fps,
+                self._waiting_audio)
+        else:
+            self._waiting_video_playing = False
+            self._start_thinking_animation()
+            self._set_dot("● Thinking …", "#e67e22")
+            self._update_status("Querying knowledge base …")
 
         self._current_bot_bubble = ChatBubble("", is_user=False)
         self.chat_layout.addWidget(self._current_bot_bubble)
@@ -649,29 +674,15 @@ class MainWindow(QMainWindow):
                 docs = self.kb.query(question, top_k=5)
                 self.signals.status.emit("Generating response …")
 
-                buffer = ""
-                sent_idx = 0
-
+                full_text = ""
                 for token in self.llm.generate_response_stream(
                         question, docs):
                     if self._query_id != qid:
                         return
                     self.signals.bot_message_append.emit(token)
-                    buffer += token
+                    full_text += token
 
-                    sentences, buffer = _extract_sentences(buffer)
-                    for s in sentences:
-                        s = s.strip()
-                        if s:
-                            self._dispatch_sentence(sent_idx, s, qid)
-                            sent_idx += 1
-
-                if buffer.strip():
-                    self._dispatch_sentence(
-                        sent_idx, buffer.strip(), qid)
-                    sent_idx += 1
-
-                if sent_idx == 0:
+                if not full_text.strip():
                     self.signals.system_message.emit(
                         "No response generated.")
                     self.signals.status.emit("Ready")
@@ -679,57 +690,98 @@ class MainWindow(QMainWindow):
                     self.signals.enable_input.emit()
                     return
 
-                self.signals.all_sentences_dispatched.emit(sent_idx)
+                if self._query_id != qid:
+                    return
+
+                tts_text = _clean_for_tts(full_text)
+                self.signals.status.emit("Synthesizing speech …")
+                audio_path = os.path.join(TEMP_DIR, "response.wav")
+                audio_path = self.voice.synthesize(
+                    tts_text, out_path=audio_path)
+
+                if self._query_id != qid:
+                    return
+
+                if (ENABLE_LIPSYNC and self.av_eng.wav2lip_available
+                        and audio_path):
+                    self.signals.status.emit(
+                        "Generating lip-sync video …")
+                    video = \
+                        self.av_eng.generate_talking_video_cached(
+                            audio_path)
+                    if video and self._query_id == qid:
+                        video_audio = video.replace(
+                            ".mp4", "_audio.wav")
+                        if not os.path.isfile(video_audio):
+                            self.av_eng.extract_audio_from_video(
+                                video, video_audio)
+                        qimages = \
+                            self.av_eng.extract_frames_as_qimages(
+                                video)
+                        fps = self.av_eng.get_video_fps(video)
+                        if qimages:
+                            self._pending_response_frames = qimages
+                            self._pending_response_fps = fps
+                            self._pending_response_audio = (
+                                video_audio
+                                if os.path.isfile(video_audio)
+                                else audio_path)
+                            self._pending_response_video = video
+                            self.signals.response_video_ready.emit()
+                            return
+
+                self.signals.status.emit("Ready")
+                self._is_processing = False
+                self.signals.enable_input.emit()
 
             except Exception as exc:
-                log.error("Streaming pipeline error: %s", exc)
-                self.signals.system_message.emit(
-                    f"Error: {exc}")
+                log.error("Response pipeline error: %s", exc)
+                self.signals.system_message.emit(f"Error: {exc}")
                 self.signals.status.emit("Ready")
                 self._is_processing = False
                 self.signals.enable_input.emit()
 
         threading.Thread(target=_producer, daemon=True).start()
 
-    def _dispatch_sentence(self, idx: int, text: str, qid: int):
-        """Submit TTS (and Wav2Lip) jobs for one sentence."""
-        tts_text = _clean_for_tts(text)
+    # ── Response video playback 
 
-        def _tts_job():
-            if self._query_id != qid:
-                return
-            out_path = os.path.join(TEMP_DIR, f"sentence_{idx}.wav")
-            try:
-                audio_path = self.voice.synthesize(tts_text, out_path=out_path)
-            except Exception as exc:
-                log.error("TTS failed for sentence %d: %s", idx, exc)
-                return
-            if self._query_id != qid:
-                return
-            self.signals.sentence_audio_ready.emit(idx, audio_path)
+    def _on_response_video_ready(self):
+        """Background thread finished generating the lip-sync video."""
+        if self._pending_response_frames:
+            self._pending_response_frames = \
+                self.av_eng.qimages_to_pixmaps(
+                    self._pending_response_frames)
 
-            if ENABLE_LIPSYNC and self.av_eng.wav2lip_available \
-                    and audio_path:
-                self._w2l_pool.submit(_w2l_job, idx, audio_path)
+        self._is_processing = False
+        self.signals.enable_input.emit()
 
-        def _w2l_job(s_idx, audio_p):
-            if self._query_id != qid:
-                return
-            try:
-                video = self.av_eng.generate_talking_video_cached(audio_p)
-                if not video or self._query_id != qid:
-                    return
-                qimages = self.av_eng.extract_frames_as_qimages(video)
-                fps = self.av_eng.get_video_fps(video)
-                if qimages:
-                    self.signals.sentence_lipsync_ready.emit(
-                        s_idx, qimages, fps, video)
-            except Exception as exc:
-                log.warning("Wav2Lip sentence %d failed: %s", s_idx, exc)
+        if self._waiting_video_playing:
+            return
 
-        self._tts_pool.submit(_tts_job)
+        self._play_response_video()
 
-    # ── Audio-only playback (Phase 1 — immediate) 
+    def _play_response_video(self):
+        """Play the single whole-response lip-sync video."""
+        if not self._pending_response_frames:
+            self._update_status("Ready")
+            return
+
+        self.think_timer.stop()
+
+        self._last_response_frames = list(
+            self._pending_response_frames)
+        self._last_response_fps = self._pending_response_fps
+        self._last_response_audio = self._pending_response_audio
+        self._last_response_video = self._pending_response_video
+
+        self._pending_response_frames = []
+
+        self._start_playback(
+            list(self._last_response_frames),
+            self._last_response_fps,
+            self._last_response_audio)
+
+    # ── Audio-only playback (greeting fallback) 
 
     def _play_audio_only(self, audio_path: str):
         self.think_timer.stop()
@@ -741,26 +793,18 @@ class MainWindow(QMainWindow):
         self._audio_start_time = time.time()
 
         self.voice.play_audio_nonblocking(audio_path)
-
-        try:
-            with _wave.open(audio_path, "rb") as wf:
-                self._audio_duration_ms = int(
-                    wf.getnframes() / wf.getframerate() * 1000)
-        except Exception:
-            self._audio_duration_ms = 5000
-
-        self._audio_done_timer.start(self._audio_duration_ms + 500)
+        self._audio_done_timer.start(5000)
 
     def _on_audio_only_done(self):
         self._audio_only_playing = False
-        if not self._is_speaking and not self._streaming_playback:
+        if not self._is_speaking:
             self.avatar_label.setPixmap(self.av_eng.get_idle_pixmap())
             self._set_speaking_style(False)
             self._set_dot("● Idle", COLOR_SUBTEXT)
             self._update_status("Ready")
             self._update_replay_btn()
 
-    # ── Streaming sentence playback 
+    # ── Streaming text to chat bubble 
 
     def _append_to_bot_bubble(self, token: str):
         if self._current_bot_bubble:
@@ -770,179 +814,11 @@ class MainWindow(QMainWindow):
                 self._last_scroll_t = now
                 QTimer.singleShot(30, self._scroll_chat_to_bottom)
 
-    def _on_sentence_audio_ready(self, idx: int, audio_path: str):
-        """TTS for sentence *idx* finished — store and maybe play."""
-        self._sentence_data.setdefault(idx, {})
-        self._sentence_data[idx]["audio_path"] = audio_path
-
-        if idx == self._next_play_idx:
-            self._play_next_sentence()
-
-    def _play_next_sentence(self):
-        """Play the next sentence in order if audio is ready."""
-        idx = self._next_play_idx
-        data = self._sentence_data.get(idx)
-        if not data or not data.get("audio_path"):
-            return
-
-        audio_path = data["audio_path"]
-        self._current_sentence_playing_idx = idx
-
-        if idx == 0:
-            self.think_timer.stop()
-
-        self._set_speaking_style(True)
-        self._set_dot("● Speaking", "#27ae60")
-        self._update_status("Speaking …")
-
-        if data.get("frames"):
-            self._is_speaking = True
-            self._audio_only_playing = False
-            self._frames = data["frames"]
-            self._frame_idx = 0
-            fps = data.get("fps", 25.0)
-            self.frame_timer.start(max(1, int(1000 / fps)))
-        else:
-            self._audio_only_playing = True
-            self._audio_start_time = time.time()
-            self._is_speaking = False
-
-        self.voice.play_audio_nonblocking(audio_path)
-
-        try:
-            with _wave.open(audio_path, "rb") as wf:
-                duration_ms = int(
-                    wf.getnframes() / wf.getframerate() * 1000)
-        except Exception:
-            duration_ms = 3000
-
-        self._sentence_done_timer.start(duration_ms + 200)
-
-    def _on_sentence_playback_done(self):
-        """Current sentence audio finished — advance to next."""
-        self.frame_timer.stop()
-        self._is_speaking = False
-        self._audio_only_playing = False
-
-        self._next_play_idx += 1
-
-        if (self._total_sentence_count is not None
-                and self._next_play_idx >= self._total_sentence_count):
-            self._finish_streaming_playback()
-            return
-
-        self._play_next_sentence()
-
-    def _finish_streaming_playback(self):
-        """All sentences played — reset to idle."""
-        self._streaming_playback = False
-        self.avatar_label.setPixmap(self.av_eng.get_idle_pixmap())
-        self._set_speaking_style(False)
-        self._set_dot("● Idle", COLOR_SUBTEXT)
-        self._update_status("Ready")
-        self._build_replay_data()
-        self._update_replay_btn()
-
-    def _on_sentence_lipsync_ready(self, idx: int, qimages: list,
-                                   fps: float, video_path: str):
-        """Wav2Lip finished for sentence *idx*. Store QImages for live
-        playback, and video path for lightweight replay storage."""
-        self._sentence_data.setdefault(idx, {})
-        self._sentence_data[idx]["frames"] = qimages
-        self._sentence_data[idx]["fps"] = fps
-        self._sentence_data[idx]["video_path"] = video_path
-
-        if idx < len(self._last_response_sentences):
-            self._last_response_sentences[idx]["video_path"] = video_path
-            self._last_response_sentences[idx]["fps"] = fps
-            self._update_replay_btn()
-            log.info("Lip-sync for sentence %d ready for replay.", idx)
-
-        if (self._audio_only_playing
-                and self._current_sentence_playing_idx == idx
-                and qimages):
-            elapsed_s = time.time() - self._audio_start_time
-            frame_offset = int(elapsed_s * fps)
-            if frame_offset < len(qimages):
-                self._audio_only_playing = False
-                self._is_speaking = True
-                self._frames = qimages
-                self._frame_idx = frame_offset
-                self.frame_timer.start(max(1, int(1000 / fps)))
-                log.info("Switched sentence %d to lip-sync at frame "
-                         "%d/%d", idx, frame_offset, len(qimages))
-
-    def _on_all_sentences_dispatched(self, total_count: int):
-        """LLM finished streaming — all sentences sent to TTS."""
-        self._total_sentence_count = total_count
-        self._is_processing = False
-        self.signals.enable_input.emit()
-
-        if self._next_play_idx >= total_count:
-            self._finish_streaming_playback()
-
-    def _build_replay_data(self):
-        """Store lightweight replay data (video paths, not frames)."""
-        self._last_response_sentences = []
-        first_audio = ""
-
-        for idx in sorted(self._sentence_data.keys()):
-            data = self._sentence_data[idx]
-            audio = data.get("audio_path", "")
-            video = data.get("video_path", "")
-            if not video and audio:
-                cached = self.av_eng.get_cached_video(audio)
-                if cached:
-                    video = cached
-            entry = {
-                "audio_path": audio,
-                "video_path": video,
-                "fps": data.get("fps", 25.0),
-            }
-            self._last_response_sentences.append(entry)
-            if audio and not first_audio:
-                first_audio = audio
-
-        self._last_response_audio = first_audio
-        self._last_response_frames = []
-        self._last_response_fps = 25.0
-
-        self._sentence_data.clear()
-
-    # ── Mid-playback lip-sync switch (Phase 2 delivers frames) 
-
-    def _on_lipsync_ready(self, frames: list, fps: float):
-        if not frames:
-            return
-
-        if self._audio_only_playing:
-            elapsed_s = time.time() - self._audio_start_time
-            frame_offset = int(elapsed_s * fps)
-
-            if frame_offset < len(frames):
-                self._audio_done_timer.stop()
-                self._audio_only_playing = False
-                self._is_speaking = True
-                self._frames = frames
-                self._frame_idx = frame_offset
-                interval = max(1, int(1000 / fps))
-                self.frame_timer.start(interval)
-                log.info("Switched to lip-sync at frame %d/%d",
-                         frame_offset, len(frames))
-                return
-
-        self._update_replay_btn()
-
     # ── Replay button 
 
     def _update_replay_btn(self):
-        if self._last_response_sentences:
-            has_lipsync = any(
-                s.get("video_path") for s in self._last_response_sentences)
-            label = "▶  Replay Last Response"
-            if has_lipsync:
-                label += " (lip-sync)"
-            self.replay_btn.setText(label)
+        if self._last_response_frames and self._last_response_audio:
+            self.replay_btn.setText("▶  Replay Last Response (lip-sync)")
             self.replay_btn.setEnabled(True)
         elif self._greeting_frames and self._greeting_audio:
             self.replay_btn.setText("▶  Replay Greeting")
@@ -1028,7 +904,8 @@ class MainWindow(QMainWindow):
     def _next_frame(self):
         if self._frame_idx >= len(self._frames):
             self.frame_timer.stop()
-            if self._streaming_playback:
+            if self._waiting_video_playing:
+                self._on_waiting_video_done()
                 return
             self._is_speaking = False
             self.avatar_label.setPixmap(self.av_eng.get_idle_pixmap())
