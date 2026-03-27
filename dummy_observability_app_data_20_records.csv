@@ -1,0 +1,21 @@
+Application ID,App Name,Application Tier,Incident TTR (hrs),Monitoring Level,Observability Risk Score
+APP-1001,Orion Portal,Tier 1,1.8,Advanced,22
+APP-1002,Nimbus Billing,Tier 2,3.4,Standard,41
+APP-1003,Helix Scheduler,Tier 3,6.2,Basic,73
+APP-1004,Vertex Claims,Tier 1,2.1,Full Stack,18
+APP-1005,Atlas Workforce,Tier 2,4.7,Standard,52
+APP-1006,Nova Dispatch,Tier 1,1.2,Advanced,27
+APP-1007,Echo Analytics,Tier 3,7.5,Basic,81
+APP-1008,Solstice CRM,Tier 2,3.0,Advanced,35
+APP-1009,Pulse Gateway,Tier 1,2.5,Full Stack,24
+APP-1010,Lumen Inventory,Tier 3,5.9,Standard,64
+APP-1011,Apex Payments,Tier 1,1.6,Advanced,29
+APP-1012,Cobalt Forms,Tier 2,4.1,Standard,47
+APP-1013,Terra Insights,Tier 3,8.3,Basic,88
+APP-1014,Quantum Orders,Tier 1,2.0,Full Stack,21
+APP-1015,Beacon Support,Tier 2,3.8,Advanced,39
+APP-1016,Summit Mobile,Tier 3,6.7,Standard,69
+APP-1017,Harbor Access,Tier 2,4.4,Basic,58
+APP-1018,Matrix Connect,Tier 1,1.9,Advanced,26
+APP-1019,Stratus Reports,Tier 2,3.3,Full Stack,33
+APP-1020,Zenith Engine,Tier 3,7.1,Basic,76

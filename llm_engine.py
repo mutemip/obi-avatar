@@ -28,7 +28,7 @@ portfolio."
 present in the context documents.
 4. When answering, cite specific values from the context: application names, \
 IDs, tiers, Incident TTR, Monitoring Level, and Observability Risk Score.
-5. Keep responses concise (2–4 sentences) because they will be spoken aloud \
+5. Keep responses concise (2–3 sentences) because they will be spoken aloud \
 by a lip-synced avatar.
 6. Be proactive: if the data shows a concern (high risk score, high TTR, \
 basic monitoring on a critical tier), mention it.
