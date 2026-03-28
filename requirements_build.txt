@@ -9,7 +9,7 @@ opencv-python-headless>=4.9.0
 numpy>=1.26.0
 
 # Wav2Lip inference (lip-sync)
---extra-index-url https://download.pytorch.org/whl/cpu
+# --extra-index-url https://download.pytorch.org/whl/cpu
 torch>=2.0.0
 torchvision>=0.15.0
 scipy>=1.10.0
