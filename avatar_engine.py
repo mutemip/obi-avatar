@@ -5,12 +5,16 @@ a sequence of QPixmap frames that the Qt UI can display.
 
 Wav2Lip pipeline:
   avatar.png  +  response.wav  ->  [Wav2Lip]  ->  output.mp4  ->  frames
+
+Fallback pipeline (no Wav2Lip / no checkpoint):
+  avatar.png  +  response.wav  ->  [amplitude-driven jaw warp]  ->  output.mp4
 """
 import hashlib
 import logging
 import os
 import subprocess
 import sys
+import wave as wave_mod
 
 import cv2
 import numpy as np
@@ -34,9 +38,16 @@ class AvatarEngine:
     def __init__(self):
         self.wav2lip_available = self._check_wav2lip()
         self.static_frame = self._load_static_avatar()
+        self._mouth_y_ratio = self._detect_mouth_region()
         self._video_cache: dict[str, str] = {}
         self._scan_cache()
         self._evict_cache()
+
+    @property
+    def can_generate_video(self) -> bool:
+        """True if any video generation path is available (Wav2Lip or fallback)."""
+        return self.wav2lip_available or (
+            os.path.isfile(AVATAR_IMAGE) and bool(FFMPEG_BIN))
 
     def _check_wav2lip(self) -> bool:
         inference = os.path.join(WAV2LIP_DIR, "inference.py")
@@ -53,6 +64,26 @@ class AvatarEngine:
             return False
         log.info("Wav2Lip is available.")
         return True
+
+    def _detect_mouth_region(self) -> float:
+        """Detect vertical mouth position as a ratio of image height."""
+        if not os.path.isfile(AVATAR_IMAGE):
+            return 0.72
+        img = cv2.imread(AVATAR_IMAGE)
+        if img is None:
+            return 0.72
+        try:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            cascade = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+            faces = cascade.detectMultiScale(gray, scaleFactor=1.1,
+                                             minNeighbors=4)
+            if len(faces) > 0:
+                _, fy, _, fh = max(faces, key=lambda f: f[2] * f[3])
+                return min((fy + int(fh * 0.75)) / img.shape[0], 0.85)
+        except Exception:
+            pass
+        return 0.72
 
     def _load_static_avatar(self) -> QPixmap:
         if os.path.isfile(AVATAR_IMAGE):
@@ -195,14 +226,116 @@ class AvatarEngine:
             log.warning("Audio extraction from video failed: %s", e)
         return ""
 
+    # ── Fallback animation (amplitude-driven jaw warp) ──────────────────
+
+    def generate_fallback_talking_video(self, audio_path: str,
+                                        out_path: str = None,
+                                        fps: int = 25) -> str:
+        """Lightweight talking animation driven by audio amplitude.
+        Works on any platform — no Wav2Lip, no CUDA, no checkpoint needed.
+        Uses cv2 remap to warp the lower face proportional to volume."""
+        if not os.path.isfile(AVATAR_IMAGE):
+            return ""
+        img = cv2.imread(AVATAR_IMAGE)
+        if img is None or not audio_path or not os.path.isfile(audio_path):
+            return ""
+
+        try:
+            with wave_mod.open(audio_path, "rb") as wf:
+                n_ch = wf.getnchannels()
+                sw = wf.getsampwidth()
+                rate = wf.getframerate()
+                raw = wf.readframes(wf.getnframes())
+        except Exception as exc:
+            log.warning("Fallback: cannot read audio — %s", exc)
+            return ""
+
+        dtype = {1: np.uint8, 2: np.int16, 4: np.int32}.get(sw, np.int16)
+        samples = np.frombuffer(raw, dtype=dtype).astype(np.float64)
+        if dtype == np.uint8:
+            samples -= 128
+        if n_ch > 1:
+            samples = samples[::n_ch]
+
+        duration = len(samples) / rate
+        n_frames = max(1, int(duration * fps))
+        spf = len(samples) / n_frames
+
+        amps = np.array([
+            np.sqrt(np.mean(
+                samples[int(i * spf):int((i + 1) * spf)] ** 2))
+            for i in range(n_frames)
+        ])
+        peak = amps.max() or 1.0
+        amps /= peak
+
+        alpha = 0.35
+        for i in range(1, len(amps)):
+            amps[i] = alpha * amps[i] + (1 - alpha) * amps[i - 1]
+
+        h, w = img.shape[:2]
+        mouth_y = int(h * self._mouth_y_ratio)
+        max_shift = max(2, int(h * 0.015))
+        below = max(h - mouth_y, 1)
+
+        map_x = np.tile(np.arange(w, dtype=np.float32), (h, 1))
+        base_map_y = np.tile(
+            np.arange(h, dtype=np.float32).reshape(-1, 1), (1, w))
+        ys_below = np.arange(mouth_y, h, dtype=np.float32)
+        progress = (ys_below - mouth_y) / below
+
+        if out_path is None:
+            out_path = os.path.join(TEMP_DIR, "talking_fallback.mp4")
+        temp_avi = out_path + ".tmp.avi"
+
+        writer = cv2.VideoWriter(
+            temp_avi, cv2.VideoWriter_fourcc(*"MJPG"), fps, (w, h))
+
+        for amp in amps:
+            if amp < 0.04:
+                writer.write(img)
+                continue
+            shift = float(amp * max_shift)
+            map_y = base_map_y.copy()
+            map_y[mouth_y:, :] = (
+                ys_below - shift * (1 - progress)).reshape(-1, 1)
+            frame = cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_REFLECT_101)
+            writer.write(frame)
+
+        writer.release()
+
+        try:
+            subprocess.run(
+                [FFMPEG_BIN, "-y",
+                 "-i", temp_avi, "-i", audio_path,
+                 "-c:v", "libx264", "-preset", "fast",
+                 "-pix_fmt", "yuv420p",
+                 "-c:a", "aac", "-shortest", out_path],
+                capture_output=True, timeout=120, check=True,
+            )
+        except Exception as exc:
+            log.warning("Fallback video mux failed: %s", exc)
+            return ""
+        finally:
+            try:
+                os.remove(temp_avi)
+            except OSError:
+                pass
+
+        if os.path.isfile(out_path):
+            log.info("Fallback talking video ready: %s", out_path)
+            return out_path
+        return ""
+
     # ── Wav2Lip generation ────────────────────────────────────────────────
 
     def generate_talking_video(self, audio_path: str,
                                out_path: str = None,
                                resize_factor: int = 2) -> str:
         if not self.wav2lip_available:
-            log.warning("Wav2Lip unavailable — skipping lip-sync generation.")
-            return ""
+            log.info("Wav2Lip unavailable — using amplitude-based fallback.")
+            return self.generate_fallback_talking_video(audio_path, out_path)
 
         audio_path = os.path.abspath(audio_path)
         if out_path is None:

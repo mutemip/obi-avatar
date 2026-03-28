@@ -653,7 +653,7 @@ class MainWindow(QMainWindow):
         self._last_response_fps = 25.0
         self._last_response_video = ""
 
-        if (ENABLE_LIPSYNC and self.av_eng.wav2lip_available
+        if (ENABLE_LIPSYNC and self.av_eng.can_generate_video
                 and self._waiting_frames and self._waiting_audio):
             self._waiting_video_playing = True
             self._start_playback(
@@ -702,7 +702,7 @@ class MainWindow(QMainWindow):
                 if self._query_id != qid:
                     return
 
-                if (ENABLE_LIPSYNC and self.av_eng.wav2lip_available
+                if (ENABLE_LIPSYNC and self.av_eng.can_generate_video
                         and audio_path):
                     self.signals.status.emit(
                         "Generating lip-sync video …")
