@@ -237,8 +237,15 @@ class AvatarEngine:
                 preexec_fn=_low_priority,
             )
             if result.returncode != 0:
+                log.error("Wav2Lip failed (exit code %d).", result.returncode)
                 log.error("Wav2Lip stdout:\n%s", result.stdout[-2000:])
                 log.error("Wav2Lip stderr:\n%s", result.stderr[-2000:])
+                print(f"\n{'='*60}")
+                print("WAV2LIP FAILED — subprocess output below:")
+                print(f"{'='*60}")
+                print("STDOUT:", result.stdout[-3000:])
+                print("STDERR:", result.stderr[-3000:])
+                print(f"{'='*60}\n")
                 if resize_factor < 2 and "OutOfMemoryError" in result.stderr:
                     log.info("Retrying with --resize_factor 2 …")
                     return self.generate_talking_video(
