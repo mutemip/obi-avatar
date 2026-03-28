@@ -212,7 +212,7 @@ class MainWindow(QMainWindow):
             QMainWindow, QWidget {{
                 background-color: {COLOR_BG};
                 color: {COLOR_TEXT};
-                font-family: 'Inter', 'Segoe UI', sans-serif;
+                font-family: 'Inter', 'SF Pro Display', 'Helvetica Neue', 'Segoe UI', sans-serif;
             }}
             QStatusBar {{
                 background: {COLOR_PANEL}; color: {COLOR_SUBTEXT}; font-size: 11px;
@@ -730,7 +730,10 @@ class MainWindow(QMainWindow):
                             self.signals.response_video_ready.emit()
                             return
 
-                self.signals.status.emit("Ready")
+                if audio_path and os.path.isfile(audio_path):
+                    self._last_response_audio = audio_path
+                    self.signals.speak_audio_only.emit(audio_path)
+
                 self._is_processing = False
                 self.signals.enable_input.emit()
 
